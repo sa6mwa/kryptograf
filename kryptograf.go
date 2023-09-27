@@ -34,6 +34,10 @@
 //
 //	go run github.com/sa6mwa/kryptograf/cmd/newkey@latest
 //
+// This documentation was generated with the following command:
+//
+//	go run github.com/princjef/gomarkdoc/cmd/gomarkdoc@latest > README.md
+//
 // kryptograf Copyright (c) 2023 Michel Blomgren sa6mwa@gmail.com
 //
 // Permission is hereby granted, free of charge, to any person
@@ -60,6 +64,7 @@ package kryptograf
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -70,10 +75,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/sa6mwa/kryptograf/internal/pkg/crand"
+	authtoken "github.com/sa6mwa/kryptograf/internal/pkg/tokenauth"
 )
 
 const (
-	DefaultEncryptionKey string = "TfLe2CpLn6qs8t6eQmGJnFGkU8NskfcC9AWOSEFlnLY"
+	DefaultEncryptionKey     string = "TfLe2CpLn6qs8t6eQmGJnFGkU8NskfcC9AWOSEFlnLY"
+	DefaultPersisterEndpoint string = "http://localhost:11185"
 )
 
 var (
@@ -83,6 +96,7 @@ var (
 var (
 	ErrKeyLength            error = errors.New("key length must be 16, 24 or 32 (for AES-128, AES-192 or AES-256)")
 	ErrHMACValidationFailed error = errors.New("HMAC validation failed (corrupt data or wrong encryption key)")
+	ErrStop                 error = errors.New("stopped processing json stream")
 )
 
 type Kryptograf interface {
@@ -156,6 +170,7 @@ type Kryptograf interface {
 	// Kryptograf_EncryptToJson.
 	//
 	// Example:
+	//
 	//	jsonText := `{"msgkey_eg_timestamp":"base64ciphertext"}`
 	//	plaintexts, err := k.RecvFromJson(json.NewDecoder(strings.NewReader(jsonText)))
 	//	if err == io.EOF {
@@ -173,6 +188,36 @@ type Kryptograf interface {
 	// in messages fail to be encrypted the function will return an
 	// error.
 	EncryptToJson(messages map[string][]byte, w io.Writer) error
+
+	// RecvFunc uses json.NewDecoder(jsonStream).Decode to read one or
+	// more {"key":"ciphertext"} into map[string][]byte from
+	// jsonStream. Key and decrypted ciphertext is passed as key and
+	// plaintext to function f. If json Decode or kryptograf Decrypt
+	// returns an error it is passed as err to function f in which case
+	// key and plaintext will likely be empty and nil respectively. If
+	// function f returns kryptograf.ErrStop it is treated as a break
+	// and RecvFunc will return with a nil error. Any other error
+	// returned by function f will cause RecvFunc to return immediately
+	// with that error while nil errors will continue the receive loop
+	// (until jsonStream is closed or an error occurs).
+	RecvFunc(jsonStream io.Reader, f func(key string, plaintext []byte, err error) error) error
+
+	// SendFunc uses json.NewEncoder(jsonStream).Encode to write
+	// {"key":"ciphertext"} objects to jsonStream compatible with the
+	// json encrypt functions provided by Kryptograf (e.g RecvFromJson,
+	// RecvFromJsonStream or RecvFunc). Function f is repeatedly called
+	// and expected to return a key (for example timestamp, message
+	// type, name, etc), plaintext as a byte slice and error code. If
+	// the error returned from f is kryptograf.ErrStop it is treated as
+	// a break and SendFunc returns a nil error. Any other error
+	// returned by f causes SendFunc to return with that error
+	// immediately. Plaintext is passed through Encrypt, json encoded
+	// into into {"key":"ciphertext"} and written to the
+	// jsonStream. Please note, if plaintext is nil, no json message is
+	// sent. If there are no errors, function f is repeatedly called and
+	// every returned plaintext results in a {"key":"ciphertext"} object
+	// written to jsonStream.
+	SendFunc(jsonStream io.Writer, f func() (key string, plaintext []byte, err error)) error
 }
 
 type kryptograf struct {
@@ -307,9 +352,9 @@ func (k *kryptograf) DecryptString(base64RawStdEncodedData string) ([]byte, erro
 }
 
 func (k *kryptograf) RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (map[string][]byte, error) {
-	var kv map[string][]byte
 	output := make(map[string][]byte)
 	for {
+		var kv map[string][]byte
 		if err := j.Decode(&kv); err != nil {
 			return nil, err
 		}
@@ -344,6 +389,55 @@ func (k *kryptograf) EncryptToJson(messages map[string][]byte, w io.Writer) erro
 		}
 	}
 	return nil
+}
+
+func (k *kryptograf) RecvFunc(jsonStream io.Reader, f func(key string, plaintext []byte, err error) error) error {
+	j := json.NewDecoder(jsonStream)
+	for {
+		var kv map[string][]byte
+		if err := j.Decode(&kv); err == nil {
+			for key, value := range kv {
+				plaintext, e := k.Decrypt(value)
+				if err := f(key, plaintext, e); err != nil {
+					if err == ErrStop {
+						return nil
+					}
+					return err
+				}
+			}
+		} else {
+			if err := f("", nil, err); err != nil {
+				if err == ErrStop {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
+func (k *kryptograf) SendFunc(jsonStream io.Writer, f func() (key string, plaintext []byte, err error)) error {
+	j := json.NewEncoder(jsonStream)
+	for {
+		key, plaintext, err := f()
+		if err != nil {
+			if err == ErrStop {
+				return nil
+			}
+			return err
+		}
+		if plaintext != nil {
+			kv := make(map[string][]byte)
+			ciphertext, err := k.Encrypt(plaintext)
+			if err != nil {
+				return err
+			}
+			kv[key] = ciphertext
+			if err := j.Encode(&kv); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // NewKey generates a 32 byte base64 encoded random string for use as
@@ -440,10 +534,219 @@ func Decrypt(key []byte, data []byte) ([]byte, error) {
 	return deciphered, nil
 }
 
+// ToBinaryEncryptionKey takes a base64 raw standard encoded string
+// and decodes it into a byte slice.
 func ToBinaryEncryptionKey(base64RawStdEncoding string) ([]byte, error) {
-	binkey, err := base64.RawStdEncoding.DecodeString(base64RawStdEncoding)
-	if err != nil {
-		return nil, err
+	return base64.RawStdEncoding.DecodeString(base64RawStdEncoding)
+}
+
+// RandomStamp returns time.Now().UTC() as time.Format
+// "20060102T150405.999999999_{19 character random int63}". If one tm
+// is provided in the optional variadic argument, the first time.Time
+// from the tm slice is used instead of time.Now().UTC(). Intended
+// usage of this function is for creating keys for a KV
+// map[string][]byte pair sent as a json stream.
+func RandomStamp(tm ...time.Time) string {
+	format := "20060102T150405.999999999"
+	t := time.Now().UTC()
+	if len(tm) > 0 {
+		t = tm[0]
 	}
-	return binkey, nil
+	return t.Format(format) + fmt.Sprintf("_%.19d", crand.Int63())
+}
+
+// Persistence API client toward server
+// github.com/sa6mwa/kryptografpersister.
+type Persistence struct {
+	// endpoint to kryptografpersister (defaults to http://localhost:11185)
+	endpoint string
+	token    string
+	key      []byte
+	k        Kryptograf
+	u        *url.URL
+	c        *http.Client
+}
+
+// Returns a new kryptograf.Persistence API client. Persistence is
+// used to send a kryptograf json stream to
+// github.com/sa6mwa/kryptografpersister. The persister is a HTTP API
+// that consume ciphertext from a map[string][]byte json stream (e.g
+// EncryptToJson or SendFunc) and store in an AnystoreDB. The server
+// (persister) does not know of the client's key and can therefore not
+// decrypt or validate the ciphertext. Keys can be retrieved from the
+// server via GET requests and will be seamlessly decrypted using this
+// Persistence client.
+//
+//	newKey := kryptograf.NewKey()
+//	k, err := kryptograf.NewKryptograf().EnableGzip().SetEncryptionKey(newKey)
+//	if err != nil {
+//		panic(err)
+//	}
+//	// Assume kryptografpersister is running on http://localhost:11185
+//	pc, err := kryptograf.NewPersistenceClient("", newKey, k)
+//	if err != nil {
+//		panic(err)
+//	}
+//	if err := pc.Store(context.Background(), "myThing", []byte("Hello world")); err != nil {
+//		panic(err)
+//	}
+func NewPersistenceClient(persisterURL, bearerToken string, k Kryptograf) (*Persistence, error) {
+	p := &Persistence{
+		endpoint: strings.TrimSpace(persisterURL),
+		token:    strings.TrimSpace(bearerToken),
+		k:        k,
+	}
+	if p.endpoint == "" {
+		p.endpoint = DefaultPersisterEndpoint
+	}
+	if u, err := url.Parse(p.endpoint); err != nil {
+		return nil, err
+	} else {
+		p.u = u
+	}
+	p.c = &http.Client{
+		Transport: http.DefaultTransport,
+		Timeout:   30 * time.Second,
+	}
+	if p.token != "" {
+		p.c.Transport = &authtoken.Injector{Token: p.token, OriginalTransport: p.c.Transport}
+	}
+	return p, nil
+}
+
+// SetHTTPClient can be used to replace the default http.Client used
+// by the Persistence client.
+func (p *Persistence) SetHTTPClient(client *http.Client) *Persistence {
+	p.c = client
+	return p
+}
+
+// SetHTTPTransport replaces the http.Client Transport.
+func (p *Persistence) SetHTTPTransport(transport *http.Transport) *Persistence {
+	if p.c != nil {
+		p.c.Transport = transport
+	}
+	return p
+}
+
+// Store persists a single key-value pair in the persister.
+func (p *Persistence) Store(ctx context.Context, key string, plaintext []byte) error {
+	if key == "" {
+		key = RandomStamp()
+	}
+	r, w := io.Pipe()
+	returnCh := make(chan error)
+	go func() {
+		kv := make(map[string][]byte, 0)
+		kv[key] = plaintext
+		if err := p.k.EncryptToJson(kv, w); err != nil {
+			returnCh <- err
+		}
+		w.Close()
+		close(returnCh)
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, p.u.String(), r)
+	if err != nil {
+		return err
+	}
+	resp, err := p.c.Do(req)
+	goferr := <-returnCh
+	if goferr != nil && err != nil {
+		return fmt.Errorf("%w: %w", err, goferr)
+	} else if err != nil {
+		return err
+	} else if goferr != nil {
+		resp.Body.Close()
+		return goferr
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	default:
+		body, err := io.ReadAll(resp.Body)
+		if err == nil {
+			return fmt.Errorf("got %d %s from server: %v", resp.StatusCode, http.StatusText(resp.StatusCode), body)
+		}
+		return fmt.Errorf("got %d %s from server, unable to read body: %w", resp.StatusCode, http.StatusText(resp.StatusCode), err)
+	}
+}
+
+// StoreFunc persists one or multiple key-value pairs in the
+// persister. Request is ended when function f returns
+// kryptograf.ErrStop or other error (uses SendFunc underneath). If
+// function f returns a nil error it sends the key and plaintext, any
+// error including ErrStop discards any key and plaintext return
+// values.
+func (p *Persistence) StoreFunc(ctx context.Context, f func() (key string, plaintext []byte, err error)) error {
+	r, w := io.Pipe()
+	returnCh := make(chan error)
+	go func() {
+		if err := p.k.SendFunc(w, f); err != nil {
+			returnCh <- err
+		}
+		w.Close()
+		close(returnCh)
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, p.u.String(), r)
+	if err != nil {
+		return err
+	}
+	resp, err := p.c.Do(req)
+	goferr := <-returnCh
+	if goferr != nil && err != nil {
+		return fmt.Errorf("%w: %w", err, goferr)
+	} else if err != nil {
+		return err
+	} else if goferr != nil {
+		resp.Body.Close()
+		return goferr
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	default:
+		body, err := io.ReadAll(resp.Body)
+		if err == nil {
+			return fmt.Errorf("got %d %s from server: %v", resp.StatusCode, http.StatusText(resp.StatusCode), body)
+		}
+		return fmt.Errorf("got %d %s from server, unable to read body: %w", resp.StatusCode, http.StatusText(resp.StatusCode), err)
+	}
+}
+
+// Not implemented yet!
+// func (p *Persistence) Load(ctx context.Context, key string) ([]byte, error) {
+// 	return nil, nil
+// }
+
+// LoadAll creates a new http request with ctx and calls function f
+// for every decrypted key-value pair returned by the server. The
+// logic of function f is the same as RecvFunc, refer to the RecvFunc
+// documentation for further information.
+func (p *Persistence) LoadAll(ctx context.Context, f func(key string, plaintext []byte, err error) error) error {
+	r, w := io.Pipe()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.u.String(), nil)
+	if err != nil {
+		return err
+	}
+	returnCh := make(chan error)
+	go func() {
+		defer close(returnCh)
+		resp, err := p.c.Do(req)
+		if err != nil {
+			returnCh <- err
+			w.Close()
+			return
+		}
+		defer resp.Body.Close()
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			returnCh <- err
+		}
+		w.Close()
+	}()
+	if err := p.k.RecvFunc(r, f); err != nil {
+		return err
+	}
+	return nil
 }
