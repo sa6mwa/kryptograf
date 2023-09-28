@@ -767,3 +767,133 @@ func TestPersistence_LoadAll(t *testing.T) {
 		}
 	}
 }
+
+func TestKeyValueMap_Get(t *testing.T) {
+	kv := kryptograf.KeyValueMap{
+		"key": []byte("value"),
+	}
+	if got, expected := string(kv.Get("key")), "value"; got != expected {
+		t.Errorf("Expected %q, got %q", expected, got)
+	}
+	if got, expected := string(kv.Get("nonexistant")), ""; got != expected {
+		t.Errorf("Expected %q, got %q", expected, got)
+	}
+}
+
+func TestKeyValueMap_Put(t *testing.T) {
+	kv := make(kryptograf.KeyValueMap)
+	if got, expected := string(kv.Get("hello")), ""; got != expected {
+		t.Errorf("Expected %q, got %q", expected, got)
+	}
+
+	if got, expected := kv.Put("hello", []byte("world")), error(nil); got != expected {
+		t.Errorf("Expected err %v, got %v", expected, got)
+	}
+
+	if got, expected := kv.Put("hello", []byte("world")), kryptograf.ErrKeyExists; got != expected {
+		t.Errorf("Expected err %v, got %v", expected, got)
+	}
+
+	if got, expected := string(kv.Get("hello")), "world"; got != expected {
+		t.Errorf("Expected %q, got %q", expected, got)
+	}
+}
+
+func TestKeyValueMap_Delete(t *testing.T) {
+	kv := make(kryptograf.KeyValueMap)
+	if got, expected := kv.Len(), 0; got != expected {
+		t.Errorf("Expected len %d, got %d", expected, got)
+	}
+	if got, expected := kv.Put("hello", []byte("world")), error(nil); got != expected {
+		t.Errorf("Expected err %v, got %v", expected, got)
+	}
+	if got, expected := kv.Put("hello2", []byte("world two")), error(nil); got != expected {
+		t.Errorf("Expected err %v, got %v", expected, got)
+	}
+	if got, expected := string(kv.Get("hello2")), "world two"; got != expected {
+		t.Errorf("Expected %q, got %q", expected, got)
+	}
+	kv.Delete("hello2")
+	if got, expected := string(kv.Get("hello2")), ""; got != expected {
+		t.Errorf("Expected %q, got %q", expected, got)
+	}
+	if got, expected := kv.Len(), 1; got != expected {
+		t.Errorf("Expected %d key, got %d", expected, got)
+	}
+	if got, expected := kv.Put("hello", []byte("world")), kryptograf.ErrKeyExists; got != expected {
+		t.Errorf("Expected err %v, got %v", expected, got)
+	}
+	if got, expected := kv.Put("hello2", []byte("world two")), error(nil); got != expected {
+		t.Errorf("Expected err %v, got %v", expected, got)
+	}
+	if got, expected := kv.Len(), 2; got != expected {
+		t.Errorf("Expected %d keys, got %d", expected, got)
+	}
+	kv.Delete("hello")
+	kv.Delete("hello2")
+	if got, expected := kv.Len(), 0; got != expected {
+		t.Errorf("Expected %d keys, got %d", expected, got)
+	}
+}
+
+func TestKeyValueMap_PutSequential(t *testing.T) {
+	kv := make(kryptograf.KeyValueMap)
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_1"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_2"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_3"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+	kv.Delete("hello_2")
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_2"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+}
+
+func TestKeyValueMap_ForEach(t *testing.T) {
+	kv := make(kryptograf.KeyValueMap)
+
+	if err := kv.ForEach(func(key string, data []byte) error {
+		t.Error("Did not expect to end up here")
+		return errors.New("did not expected to run this code")
+	}); err != nil {
+		t.Error(err)
+	}
+
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_1"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_2"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_3"; got != expected {
+		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
+	}
+
+	if err := kv.ForEach(func(key string, data []byte) error {
+		t.Log("key:", key, "data:", string(data))
+		return nil
+	}); err != nil {
+		t.Error(err)
+	}
+
+	count := 0
+	if err := kv.ForEach(func(key string, data []byte) error {
+		count++
+		return kryptograf.ErrStop
+	}); err != nil {
+		t.Error(err)
+	}
+	if got, expected := count, 1; got != expected {
+		t.Errorf("Expected to have processed %d key-value pair, but got %d", expected, got)
+	}
+}

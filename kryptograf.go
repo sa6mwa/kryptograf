@@ -77,11 +77,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sa6mwa/kryptograf/internal/pkg/crand"
-	authtoken "github.com/sa6mwa/kryptograf/internal/pkg/tokenauth"
+	"github.com/sa6mwa/kryptograf/internal/pkg/tokenauth"
 )
 
 const (
@@ -97,6 +98,7 @@ var (
 	ErrKeyLength            error = errors.New("key length must be 16, 24 or 32 (for AES-128, AES-192 or AES-256)")
 	ErrHMACValidationFailed error = errors.New("HMAC validation failed (corrupt data or wrong encryption key)")
 	ErrStop                 error = errors.New("stopped processing json stream")
+	ErrKeyExists            error = errors.New("key already exist in KeyValueMap")
 )
 
 type Kryptograf interface {
@@ -153,14 +155,16 @@ type Kryptograf interface {
 
 	// RecvFromJson executes at least one json.Decode on j returning
 	// exactly one successfully decrypted json key/value pair as a
-	// map[string][]byte or error per call. RecvFromJson uses
-	// json.Decode underneath and can be repeatedly called on j until
-	// returning error io.EOF indicating there is no more data to read
-	// from the stream. If you require that every incoming json object
-	// is successfully decrypted you can set the optional variadic
-	// boolean to true, in which case RecvFromJson will return error if
-	// any incoming json object fail decryption. Format of the incoming
-	// json stream is:
+	// map[string][]byte (kryptograf.KeyValueMap) or error per
+	// call. RecvFromJson uses json.Decode underneath and can be
+	// repeatedly called on j until returning error io.EOF indicating
+	// there is no more data to read from the stream. RecvFromJson uses
+	// KeyValueMap_PutSequential to handle any duplicates returned since
+	// keys need to be unique. If you require that every incoming json
+	// object is successfully decrypted you can set the optional
+	// variadic boolean to true, in which case RecvFromJson will return
+	// error if any incoming json object fail decryption. Format of the
+	// incoming json stream is:
 	//
 	//	{"msg1":"base64EncodedCipherText"}
 	//	{"msg2":"base64EncodedCipherText"}
@@ -181,18 +185,18 @@ type Kryptograf interface {
 	//	for k, v := range plaintexts {
 	//		fmt.Printf("%s: %v\n", k, v)
 	//	}
-	RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (map[string][]byte, error)
+	RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (KeyValueMap, error)
 
 	// EncryptToJson sends the plaintext value as ciphertext value per
 	// each key in messages via json.Encode to w. If any of the values
 	// in messages fail to be encrypted the function will return an
 	// error.
-	EncryptToJson(messages map[string][]byte, w io.Writer) error
+	EncryptToJson(messages KeyValueMap, w io.Writer) error
 
 	// RecvFunc uses json.NewDecoder(jsonStream).Decode to read one or
-	// more {"key":"ciphertext"} into map[string][]byte from
-	// jsonStream. Key and decrypted ciphertext is passed as key and
-	// plaintext to function f. If json Decode or kryptograf Decrypt
+	// more {"key":"ciphertext"} into a KeyValueMap (map[string][]byte)
+	// from jsonStream. Key and decrypted ciphertext is passed as key
+	// and plaintext to function f. If json Decode or kryptograf Decrypt
 	// returns an error it is passed as err to function f in which case
 	// key and plaintext will likely be empty and nil respectively. If
 	// function f returns kryptograf.ErrStop it is treated as a break
@@ -223,6 +227,68 @@ type Kryptograf interface {
 type kryptograf struct {
 	key  []byte
 	gzip bool
+}
+
+type KeyValueMap map[string][]byte
+
+func (m KeyValueMap) Get(key string) []byte {
+	return m[key]
+}
+
+// Put stores data under key in KeyValueMap. If key already exist, Put
+// returns kryptograf.ErrKeyExists.
+func (m KeyValueMap) Put(key string, data []byte) error {
+	if _, exists := m[key]; exists {
+		return ErrKeyExists
+	}
+	m[key] = data
+	return nil
+}
+
+// PutSequential will append _{int} to key (e.g key_1) if key already
+// exist in the KeyValueMap. If key_2 exists, it will try key_3,
+// etc. Method returns the key used to store data (key or key_1,
+// key_2, etc). PutSequential is not go routine safe, use sync/atomic
+// for that.
+func (m KeyValueMap) PutSequential(key string, data []byte) string {
+	seq := 1
+	newKey := key
+	for {
+		if _, exists := m[newKey]; exists {
+			newKey = key + "_" + strconv.Itoa(seq)
+			seq++
+			continue
+		}
+		break
+	}
+	m[newKey] = data
+	return newKey
+}
+
+// Deletes key from KeyValueMap.
+func (m KeyValueMap) Delete(key string) {
+	delete(m, key)
+}
+
+// Returns the length of the KeyValueMap (number of keys).
+func (m KeyValueMap) Len() int {
+	return len(m)
+}
+
+// ForEach calls function f for each key-value pair in the
+// KeyValueMap. If function f returns kryptograf.ErrStop it is treated
+// as a break from the loop and ForEach will return a nil error. Any
+// other error returned from f is passed as the output error of
+// ForEach.
+func (m KeyValueMap) ForEach(f func(key string, data []byte) error) error {
+	for k, v := range m {
+		if err := f(k, v); err == ErrStop {
+			return nil
+		} else if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // NewKryptograf returns a new kryptograf instance with the default
@@ -351,10 +417,10 @@ func (k *kryptograf) DecryptString(base64RawStdEncodedData string) ([]byte, erro
 	return k.Decrypt(plaintext)
 }
 
-func (k *kryptograf) RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (map[string][]byte, error) {
-	output := make(map[string][]byte)
+func (k *kryptograf) RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (KeyValueMap, error) {
+	output := make(KeyValueMap)
 	for {
-		var kv map[string][]byte
+		var kv KeyValueMap
 		if err := j.Decode(&kv); err != nil {
 			return nil, err
 		}
@@ -365,7 +431,7 @@ func (k *kryptograf) RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (map[
 					return nil, err
 				}
 			} else {
-				output[key] = plaintext
+				output.PutSequential(key, plaintext)
 			}
 		}
 		if len(output) > 0 {
@@ -375,10 +441,10 @@ func (k *kryptograf) RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (map[
 	return output, nil
 }
 
-func (k *kryptograf) EncryptToJson(messages map[string][]byte, w io.Writer) error {
+func (k *kryptograf) EncryptToJson(messages KeyValueMap, w io.Writer) error {
 	jsonEncoder := json.NewEncoder(w)
 	for key, plaintext := range messages {
-		kv := make(map[string][]byte)
+		kv := make(KeyValueMap)
 		ciphertext, err := k.Encrypt(plaintext)
 		if err != nil {
 			return err
@@ -394,7 +460,7 @@ func (k *kryptograf) EncryptToJson(messages map[string][]byte, w io.Writer) erro
 func (k *kryptograf) RecvFunc(jsonStream io.Reader, f func(key string, plaintext []byte, err error) error) error {
 	j := json.NewDecoder(jsonStream)
 	for {
-		var kv map[string][]byte
+		var kv KeyValueMap
 		if err := j.Decode(&kv); err == nil {
 			for key, value := range kv {
 				plaintext, e := k.Decrypt(value)
@@ -427,7 +493,7 @@ func (k *kryptograf) SendFunc(jsonStream io.Writer, f func() (key string, plaint
 			return err
 		}
 		if plaintext != nil {
-			kv := make(map[string][]byte)
+			kv := make(KeyValueMap)
 			ciphertext, err := k.Encrypt(plaintext)
 			if err != nil {
 				return err
@@ -545,7 +611,7 @@ func ToBinaryEncryptionKey(base64RawStdEncoding string) ([]byte, error) {
 // is provided in the optional variadic argument, the first time.Time
 // from the tm slice is used instead of time.Now().UTC(). Intended
 // usage of this function is for creating keys for a KV
-// map[string][]byte pair sent as a json stream.
+// map[string][]byte pair (KeyValueMap) sent as a json stream.
 func RandomStamp(tm ...time.Time) string {
 	format := "20060102T150405.999999999"
 	t := time.Now().UTC()
@@ -570,12 +636,12 @@ type Persistence struct {
 // Returns a new kryptograf.Persistence API client. Persistence is
 // used to send a kryptograf json stream to
 // github.com/sa6mwa/kryptografpersister. The persister is a HTTP API
-// that consume ciphertext from a map[string][]byte json stream (e.g
-// EncryptToJson or SendFunc) and store in an AnystoreDB. The server
-// (persister) does not know of the client's key and can therefore not
-// decrypt or validate the ciphertext. Keys can be retrieved from the
-// server via GET requests and will be seamlessly decrypted using this
-// Persistence client.
+// that consume ciphertext from a KeyValueMap (map[string][]byte) json
+// stream (e.g EncryptToJson or SendFunc) and store in an
+// AnystoreDB. The server (persister) does not know of the client's
+// key and can therefore not decrypt or validate the ciphertext. Keys
+// can be retrieved from the server via GET requests and will be
+// seamlessly decrypted using this Persistence client.
 //
 //	newKey := kryptograf.NewKey()
 //	k, err := kryptograf.NewKryptograf().EnableGzip().SetEncryptionKey(newKey)
@@ -609,7 +675,7 @@ func NewPersistenceClient(persisterURL, bearerToken string, k Kryptograf) (*Pers
 		Timeout:   30 * time.Second,
 	}
 	if p.token != "" {
-		p.c.Transport = &authtoken.Injector{Token: p.token, OriginalTransport: p.c.Transport}
+		p.c.Transport = &tokenauth.Injector{Token: p.token, OriginalTransport: p.c.Transport}
 	}
 	return p, nil
 }
@@ -637,7 +703,7 @@ func (p *Persistence) Store(ctx context.Context, key string, plaintext []byte) e
 	r, w := io.Pipe()
 	returnCh := make(chan error)
 	go func() {
-		kv := make(map[string][]byte, 0)
+		kv := make(KeyValueMap)
 		kv[key] = plaintext
 		if err := p.k.EncryptToJson(kv, w); err != nil {
 			returnCh <- err
