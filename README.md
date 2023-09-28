@@ -67,6 +67,13 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 - [func NewPersistenceClient\(persisterURL, bearerToken string, k Kryptograf\) \(\*Persistence, error\)](<#NewPersistenceClient>)
 - [func RandomStamp\(tm ...time.Time\) string](<#RandomStamp>)
 - [func ToBinaryEncryptionKey\(base64RawStdEncoding string\) \(\[\]byte, error\)](<#ToBinaryEncryptionKey>)
+- [type KeyValueMap](<#KeyValueMap>)
+  - [func \(m KeyValueMap\) Delete\(key string\)](<#KeyValueMap.Delete>)
+  - [func \(m KeyValueMap\) ForEach\(f func\(key string, data \[\]byte\) error\) error](<#KeyValueMap.ForEach>)
+  - [func \(m KeyValueMap\) Get\(key string\) \[\]byte](<#KeyValueMap.Get>)
+  - [func \(m KeyValueMap\) Len\(\) int](<#KeyValueMap.Len>)
+  - [func \(m KeyValueMap\) Put\(key string, data \[\]byte\) error](<#KeyValueMap.Put>)
+  - [func \(m KeyValueMap\) PutSequential\(key string, data \[\]byte\) string](<#KeyValueMap.PutSequential>)
 - [type Kryptograf](<#Kryptograf>)
   - [func NewKryptograf\(\) Kryptograf](<#NewKryptograf>)
 - [type Persistence](<#Persistence>)
@@ -97,6 +104,7 @@ var (
     ErrKeyLength            error = errors.New("key length must be 16, 24 or 32 (for AES-128, AES-192 or AES-256)")
     ErrHMACValidationFailed error = errors.New("HMAC validation failed (corrupt data or wrong encryption key)")
     ErrStop                 error = errors.New("stopped processing json stream")
+    ErrKeyExists            error = errors.New("key already exist in KeyValueMap")
 )
 ```
 
@@ -109,7 +117,7 @@ var (
 ```
 
 <a name="Decrypt"></a>
-## func [Decrypt](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L506>)
+## func [Decrypt](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L572>)
 
 ```go
 func Decrypt(key []byte, data []byte) ([]byte, error)
@@ -118,7 +126,7 @@ func Decrypt(key []byte, data []byte) ([]byte, error)
 Decrypt authenticates and decrypts data using a 16, 24 or 32 byte long key \(for AES\-128\-CFB, AES\-224\-CFB or AES\-256\-CFB\). The data should start with a HMAC\-SHA256 hash \(32 bytes\) initialized with key. The hash function should hash the rest of data which includes an aes.BlockSize long IV and the AES\-CFB encrypted data. Returns clear\-data or error in case of failure. Returns anystore.ErrHMACValidationFailed when the key is wrong or the message is corrupt or tampered with.
 
 <a name="Encrypt"></a>
-## func [Encrypt](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L467>)
+## func [Encrypt](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L533>)
 
 ```go
 func Encrypt(key []byte, data []byte) ([]byte, error)
@@ -132,7 +140,7 @@ b = bytes
 ```
 
 <a name="NewKey"></a>
-## func [NewKey](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L447>)
+## func [NewKey](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L513>)
 
 ```go
 func NewKey() string
@@ -145,13 +153,13 @@ go run github.com/sa6mwa/kryptograf/cmd/newkey@latest
 ```
 
 <a name="NewPersistenceClient"></a>
-## func [NewPersistenceClient](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L593>)
+## func [NewPersistenceClient](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L659>)
 
 ```go
 func NewPersistenceClient(persisterURL, bearerToken string, k Kryptograf) (*Persistence, error)
 ```
 
-Returns a new kryptograf.Persistence API client. Persistence is used to send a kryptograf json stream to github.com/sa6mwa/kryptografpersister. The persister is a HTTP API that consume ciphertext from a map\[string\]\[\]byte json stream \(e.g EncryptToJson or SendFunc\) and store in an AnystoreDB. The server \(persister\) does not know of the client's key and can therefore not decrypt or validate the ciphertext. Keys can be retrieved from the server via GET requests and will be seamlessly decrypted using this Persistence client.
+Returns a new kryptograf.Persistence API client. Persistence is used to send a kryptograf json stream to github.com/sa6mwa/kryptografpersister. The persister is a HTTP API that consume ciphertext from a KeyValueMap \(map\[string\]\[\]byte\) json stream \(e.g EncryptToJson or SendFunc\) and store in an AnystoreDB. The server \(persister\) does not know of the client's key and can therefore not decrypt or validate the ciphertext. Keys can be retrieved from the server via GET requests and will be seamlessly decrypted using this Persistence client.
 
 ```
 newKey := kryptograf.NewKey()
@@ -170,16 +178,16 @@ if err := pc.Store(context.Background(), "myThing", []byte("Hello world")); err 
 ```
 
 <a name="RandomStamp"></a>
-## func [RandomStamp](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L549>)
+## func [RandomStamp](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L615>)
 
 ```go
 func RandomStamp(tm ...time.Time) string
 ```
 
-RandomStamp returns time.Now\(\).UTC\(\) as time.Format "20060102T150405.999999999\_\{19 character random int63\}". If one tm is provided in the optional variadic argument, the first time.Time from the tm slice is used instead of time.Now\(\).UTC\(\). Intended usage of this function is for creating keys for a KV map\[string\]\[\]byte pair sent as a json stream.
+RandomStamp returns time.Now\(\).UTC\(\) as time.Format "20060102T150405.999999999\_\{19 character random int63\}". If one tm is provided in the optional variadic argument, the first time.Time from the tm slice is used instead of time.Now\(\).UTC\(\). Intended usage of this function is for creating keys for a KV map\[string\]\[\]byte pair \(KeyValueMap\) sent as a json stream.
 
 <a name="ToBinaryEncryptionKey"></a>
-## func [ToBinaryEncryptionKey](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L539>)
+## func [ToBinaryEncryptionKey](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L605>)
 
 ```go
 func ToBinaryEncryptionKey(base64RawStdEncoding string) ([]byte, error)
@@ -187,8 +195,71 @@ func ToBinaryEncryptionKey(base64RawStdEncoding string) ([]byte, error)
 
 ToBinaryEncryptionKey takes a base64 raw standard encoded string and decodes it into a byte slice.
 
+<a name="KeyValueMap"></a>
+## type [KeyValueMap](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L232>)
+
+
+
+```go
+type KeyValueMap map[string][]byte
+```
+
+<a name="KeyValueMap.Delete"></a>
+### func \(KeyValueMap\) [Delete](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L269>)
+
+```go
+func (m KeyValueMap) Delete(key string)
+```
+
+Deletes key from KeyValueMap.
+
+<a name="KeyValueMap.ForEach"></a>
+### func \(KeyValueMap\) [ForEach](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L283>)
+
+```go
+func (m KeyValueMap) ForEach(f func(key string, data []byte) error) error
+```
+
+ForEach calls function f for each key\-value pair in the KeyValueMap. If function f returns kryptograf.ErrStop it is treated as a break from the loop and ForEach will return a nil error. Any other error returned from f is passed as the output error of ForEach.
+
+<a name="KeyValueMap.Get"></a>
+### func \(KeyValueMap\) [Get](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L234>)
+
+```go
+func (m KeyValueMap) Get(key string) []byte
+```
+
+
+
+<a name="KeyValueMap.Len"></a>
+### func \(KeyValueMap\) [Len](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L274>)
+
+```go
+func (m KeyValueMap) Len() int
+```
+
+Returns the length of the KeyValueMap \(number of keys\).
+
+<a name="KeyValueMap.Put"></a>
+### func \(KeyValueMap\) [Put](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L240>)
+
+```go
+func (m KeyValueMap) Put(key string, data []byte) error
+```
+
+Put stores data under key in KeyValueMap. If key already exist, Put returns kryptograf.ErrKeyExists.
+
+<a name="KeyValueMap.PutSequential"></a>
+### func \(KeyValueMap\) [PutSequential](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L253>)
+
+```go
+func (m KeyValueMap) PutSequential(key string, data []byte) string
+```
+
+PutSequential will append \_\{int\} to key \(e.g key\_1\) if key already exist in the KeyValueMap. If key\_2 exists, it will try key\_3, etc. Method returns the key used to store data \(key or key\_1, key\_2, etc\). PutSequential is not go routine safe, use sync/atomic for that.
+
 <a name="Kryptograf"></a>
-## type [Kryptograf](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L102-L221>)
+## type [Kryptograf](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L104-L225>)
 
 
 
@@ -247,14 +318,16 @@ type Kryptograf interface {
 
     // RecvFromJson executes at least one json.Decode on j returning
     // exactly one successfully decrypted json key/value pair as a
-    // map[string][]byte or error per call. RecvFromJson uses
-    // json.Decode underneath and can be repeatedly called on j until
-    // returning error io.EOF indicating there is no more data to read
-    // from the stream. If you require that every incoming json object
-    // is successfully decrypted you can set the optional variadic
-    // boolean to true, in which case RecvFromJson will return error if
-    // any incoming json object fail decryption. Format of the incoming
-    // json stream is:
+    // map[string][]byte (kryptograf.KeyValueMap) or error per
+    // call. RecvFromJson uses json.Decode underneath and can be
+    // repeatedly called on j until returning error io.EOF indicating
+    // there is no more data to read from the stream. RecvFromJson uses
+    // KeyValueMap_PutSequential to handle any duplicates returned since
+    // keys need to be unique. If you require that every incoming json
+    // object is successfully decrypted you can set the optional
+    // variadic boolean to true, in which case RecvFromJson will return
+    // error if any incoming json object fail decryption. Format of the
+    // incoming json stream is:
     //
     //	{"msg1":"base64EncodedCipherText"}
     //	{"msg2":"base64EncodedCipherText"}
@@ -275,18 +348,18 @@ type Kryptograf interface {
     //	for k, v := range plaintexts {
     //		fmt.Printf("%s: %v\n", k, v)
     //	}
-    RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (map[string][]byte, error)
+    RecvFromJson(j *json.Decoder, allMustDecrypt ...bool) (KeyValueMap, error)
 
     // EncryptToJson sends the plaintext value as ciphertext value per
     // each key in messages via json.Encode to w. If any of the values
     // in messages fail to be encrypted the function will return an
     // error.
-    EncryptToJson(messages map[string][]byte, w io.Writer) error
+    EncryptToJson(messages KeyValueMap, w io.Writer) error
 
     // RecvFunc uses json.NewDecoder(jsonStream).Decode to read one or
-    // more {"key":"ciphertext"} into map[string][]byte from
-    // jsonStream. Key and decrypted ciphertext is passed as key and
-    // plaintext to function f. If json Decode or kryptograf Decrypt
+    // more {"key":"ciphertext"} into a KeyValueMap (map[string][]byte)
+    // from jsonStream. Key and decrypted ciphertext is passed as key
+    // and plaintext to function f. If json Decode or kryptograf Decrypt
     // returns an error it is passed as err to function f in which case
     // key and plaintext will likely be empty and nil respectively. If
     // function f returns kryptograf.ErrStop it is treated as a break
@@ -316,7 +389,7 @@ type Kryptograf interface {
 ```
 
 <a name="NewKryptograf"></a>
-### func [NewKryptograf](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L233>)
+### func [NewKryptograf](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L299>)
 
 ```go
 func NewKryptograf() Kryptograf
@@ -325,7 +398,7 @@ func NewKryptograf() Kryptograf
 NewKryptograf returns a new kryptograf instance with the default encryption key and gzip disabled by default \(the value of kryptograf.GzipByDefault\). Use the method SetEncryptionKey to set your own encryption key \(from a base64 raw standard encoded string\).
 
 <a name="Persistence"></a>
-## type [Persistence](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L560-L568>)
+## type [Persistence](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L626-L634>)
 
 Persistence API client toward server github.com/sa6mwa/kryptografpersister.
 
@@ -336,7 +409,7 @@ type Persistence struct {
 ```
 
 <a name="Persistence.LoadAll"></a>
-### func \(\*Persistence\) [LoadAll](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L727>)
+### func \(\*Persistence\) [LoadAll](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L793>)
 
 ```go
 func (p *Persistence) LoadAll(ctx context.Context, f func(key string, plaintext []byte, err error) error) error
@@ -345,7 +418,7 @@ func (p *Persistence) LoadAll(ctx context.Context, f func(key string, plaintext 
 LoadAll creates a new http request with ctx and calls function f for every decrypted key\-value pair returned by the server. The logic of function f is the same as RecvFunc, refer to the RecvFunc documentation for further information.
 
 <a name="Persistence.SetHTTPClient"></a>
-### func \(\*Persistence\) [SetHTTPClient](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L619>)
+### func \(\*Persistence\) [SetHTTPClient](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L685>)
 
 ```go
 func (p *Persistence) SetHTTPClient(client *http.Client) *Persistence
@@ -354,7 +427,7 @@ func (p *Persistence) SetHTTPClient(client *http.Client) *Persistence
 SetHTTPClient can be used to replace the default http.Client used by the Persistence client.
 
 <a name="Persistence.SetHTTPTransport"></a>
-### func \(\*Persistence\) [SetHTTPTransport](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L625>)
+### func \(\*Persistence\) [SetHTTPTransport](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L691>)
 
 ```go
 func (p *Persistence) SetHTTPTransport(transport *http.Transport) *Persistence
@@ -363,7 +436,7 @@ func (p *Persistence) SetHTTPTransport(transport *http.Transport) *Persistence
 SetHTTPTransport replaces the http.Client Transport.
 
 <a name="Persistence.Store"></a>
-### func \(\*Persistence\) [Store](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L633>)
+### func \(\*Persistence\) [Store](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L699>)
 
 ```go
 func (p *Persistence) Store(ctx context.Context, key string, plaintext []byte) error
@@ -372,7 +445,7 @@ func (p *Persistence) Store(ctx context.Context, key string, plaintext []byte) e
 Store persists a single key\-value pair in the persister.
 
 <a name="Persistence.StoreFunc"></a>
-### func \(\*Persistence\) [StoreFunc](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L681>)
+### func \(\*Persistence\) [StoreFunc](<https://github.com/sa6mwa/kryptograf/blob/main/kryptograf.go#L747>)
 
 ```go
 func (p *Persistence) StoreFunc(ctx context.Context, f func() (key string, plaintext []byte, err error)) error
@@ -570,7 +643,7 @@ func Uint64() uint64
 
 
 
-# authtoken
+# tokenauth
 
 ```go
 import "github.com/sa6mwa/kryptograf/internal/pkg/tokenauth"
