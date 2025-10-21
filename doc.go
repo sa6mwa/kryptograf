@@ -152,8 +152,9 @@
 //
 // # Certificate Helpers
 //
-//	kryptograf.CertificateIDsFromFile inspects PEM bundles and returns stable identifiers
-//	for each certificate it finds (the SHA-256 hash of the DER payload):
+// kryptograf.CertificateIDsFromFile inspects PEM bundles and returns stable
+// identifiers for each certificate it finds (the SHA-256 hash of the DER
+// payload):
 //
 //	ids, err := kryptograf.CertificateIDsFromFile("/etc/service/ca.pem")
 //	if err != nil {

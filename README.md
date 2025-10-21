@@ -164,10 +164,11 @@ mat, err := kg.MintDEKWithNonceSize([]byte("stream-id"), 24) // XChaCha20
 ```
 # Certificate Helpers
 
-```go
-kryptograf.CertificateIDsFromFile inspects PEM bundles and returns stable identifiers
-for each certificate it finds (the SHA-256 hash of the DER payload):
+kryptograf.CertificateIDsFromFile inspects PEM bundles and returns stable
+identifiers for each certificate it finds (the SHA-256 hash of the DER
+payload):
 
+```go
 ids, err := kryptograf.CertificateIDsFromFile("/etc/service/ca.pem")
 if err != nil {
 	panic(err)
