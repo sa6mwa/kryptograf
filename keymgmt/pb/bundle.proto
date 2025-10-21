@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package kryptograf.keymgmt.pb;
+
+option go_package = "pkt.systems/kryptograf/keymgmt/pb";
+
+message KeyBundle {
+  bytes root_key = 1;
+  map<string, bytes> descriptors = 2;
+  PBKDF2Params pbkdf2_params = 3;
+}
+
+message PBKDF2Params {
+  string hash = 1;
+  int32 iterations = 2;
+  bytes salt = 3;
+  int32 key_length = 4;
+}

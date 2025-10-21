@@ -39,14 +39,14 @@ func nearEqual(a, b, closeEnough, maxError float64) bool {
 	return absDiff/max(math.Abs(a), math.Abs(b)) < maxError
 }
 
-func (this *statsResults) checkSimilarDistribution(expected *statsResults) error {
-	if !nearEqual(this.mean, expected.mean, expected.closeEnough, expected.maxError) {
-		s := fmt.Sprintf("mean %v != %v (allowed error %v, %v)", this.mean, expected.mean, expected.closeEnough, expected.maxError)
+func (sr *statsResults) checkSimilarDistribution(expected *statsResults) error {
+	if !nearEqual(sr.mean, expected.mean, expected.closeEnough, expected.maxError) {
+		s := fmt.Sprintf("mean %v != %v (allowed error %v, %v)", sr.mean, expected.mean, expected.closeEnough, expected.maxError)
 		fmt.Println(s)
 		return errors.New(s)
 	}
-	if !nearEqual(this.stddev, expected.stddev, expected.closeEnough, expected.maxError) {
-		s := fmt.Sprintf("stddev %v != %v (allowed error %v, %v)", this.stddev, expected.stddev, expected.closeEnough, expected.maxError)
+	if !nearEqual(sr.stddev, expected.stddev, expected.closeEnough, expected.maxError) {
+		s := fmt.Sprintf("stddev %v != %v (allowed error %v, %v)", sr.stddev, expected.stddev, expected.closeEnough, expected.maxError)
 		fmt.Println(s)
 		return errors.New(s)
 	}
@@ -75,7 +75,7 @@ func checkSampleDistribution(t *testing.T, samples []float64, expected *statsRes
 func checkSampleSliceDistributions(t *testing.T, samples []float64, nslices int, expected *statsResults) {
 	t.Helper()
 	chunk := len(samples) / nslices
-	for i := 0; i < nslices; i++ {
+	for i := range nslices {
 		low := i * chunk
 		var high int
 		if i == nslices-1 {
@@ -130,7 +130,7 @@ func TestIntn(t *testing.T) {
 	// Generate 100 x 1000 Intn(26) and ensure the standard deviation of all those
 	// deviations are less than 1.1.
 	var standardDeviations []float64
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		_, sd := sampleIntn26(1000)
 		standardDeviations = append(standardDeviations, sd)
 	}
@@ -142,7 +142,7 @@ func TestIntn(t *testing.T) {
 
 func sampleIntn26(permutations int) (mean, sd float64) {
 	m := make(map[int]int)
-	for i := 0; i < permutations; i++ {
+	for range permutations {
 		n := Intn(26)
 		m[n] = m[n] + 1
 	}

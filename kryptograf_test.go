@@ -1,899 +1,722 @@
-package kryptograf_test
+package kryptograf
 
 import (
 	"bytes"
-	"context"
-	"crypto/aes"
-	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
-	"encoding/base64"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
+	"encoding/pem"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
-	"strings"
+	"math/big"
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
-	"github.com/sa6mwa/kryptograf"
+	"pkt.systems/kryptograf/cipher"
+	"pkt.systems/kryptograf/keymgmt"
 )
 
-type Msg struct {
-	Msg string `json:"message"`
+// deterministicMaterial provides reproducible root/material pairs for examples.
+// In production, use MintDEK/EnsureDescriptor instead.
+func deterministicMaterial(label string) (keymgmt.RootKey, keymgmt.Material) {
+	rootDigest := sha256.Sum256([]byte("root:" + label))
+	var root keymgmt.RootKey
+	copy(root[:], rootDigest[:])
+
+	keyDigest := sha256.Sum256([]byte("dek:" + label))
+	var key keymgmt.DEK
+	copy(key[:], keyDigest[:])
+
+	saltDigest := sha256.Sum256([]byte("salt:" + label))
+	var salt [32]byte
+	copy(salt[:], saltDigest[:])
+
+	contextDigest := sha256.Sum256([]byte("context:" + label))
+
+	nonceDigest := sha256.Sum256([]byte("nonce:" + label))
+	var nonce [32]byte
+	copy(nonce[:], nonceDigest[:])
+
+	material := keymgmt.Material{
+		Key: key,
+		Descriptor: keymgmt.Descriptor{
+			Version:       2,
+			HKDFHash:      1,
+			NonceSize:     12,
+			Salt:          salt,
+			ContextDigest: contextDigest,
+		},
+	}
+	copy(material.Descriptor.Nonce[:], nonce[:])
+
+	return root, material
 }
 
-func toJson(v any) []byte {
-	j, err := json.MarshalIndent(v, "", "  ")
+func Example_encryptPipe() {
+	// Production setup (for reference):
+	//	store, err := Load("bundle.pem")
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	root, err := store.EnsureRootKey()
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	material, err := store.EnsureDescriptor("example", root, []byte("example"))
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	if err := store.Commit(); err != nil {
+	//		panic(err)
+	//	}
+
+	root, mat := deterministicMaterial("pipe-example")
+	kg := New(root)
+
+	inf := bytes.NewBufferString("Hello world")
+
+	cipherReader, plainWriter, err := kg.NewEncryptPipe(mat)
 	if err != nil {
-		return []byte("{}")
+		panic(err)
 	}
-	return j
+	decryptedReader, cipherWriter, err := kg.NewDecryptPipe(mat)
+	if err != nil {
+		panic(err)
+	}
+
+	var ciphertext bytes.Buffer
+	tee := io.MultiWriter(cipherWriter, &ciphertext)
+
+	go func() {
+		defer plainWriter.Close()
+		io.Copy(plainWriter, inf)
+	}()
+
+	go func() {
+		io.Copy(tee, cipherReader)
+		cipherWriter.Close()
+	}()
+
+	buf, _ := io.ReadAll(decryptedReader)
+	decryptedReader.Close()
+
+	fmt.Printf("Plaintext: %s\n", "Hello world")
+	fmt.Printf("Ciphertext: 0x%X\n", ciphertext.Bytes())
+	fmt.Printf("Decrypted: %s\n", string(buf))
+
+	// Output:
+	// Plaintext: Hello world
+	// Ciphertext: 0x0100000000000000000BDB1014C391E96333E0D1F4684025BEE8E57E3966EB827CF00FD62501010000000100000000
+	// Decrypted: Hello world
 }
 
-func TestNewKryptograf(t *testing.T) {
-	k := kryptograf.NewKryptograf()
-	defaultEncryptionKey, err := base64.RawStdEncoding.DecodeString(kryptograf.DefaultEncryptionKey)
+func Example_encryptWriter() {
+	// Production setup (for reference):
+	//	store, err := Load("bundle.pem")
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	root, err := store.EnsureRootKey()
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	material, err := store.EnsureDescriptor("file-id", root, []byte("file-id"))
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	if err := store.Commit(); err != nil {
+	//		panic(err)
+	//	}
+
+	root, mat := deterministicMaterial("file-write")
+	kg := New(root)
+
+	var ciphertext bytes.Buffer
+	writer, err := kg.EncryptWriter(&ciphertext, mat)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	if bytes.Compare(k.GetEncryptionKey(), defaultEncryptionKey) != 0 {
-		t.Errorf("%x does not match %x", k.GetEncryptionKey(), defaultEncryptionKey)
+	if _, err := io.WriteString(writer, "Hello file"); err != nil {
+		panic(err)
+	}
+	if err := writer.Close(); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Plaintext: %s\n", "Hello file")
+	fmt.Printf("Ciphertext: 0x%X\n", ciphertext.Bytes())
+
+	// Output:
+	// Plaintext: Hello file
+	// Ciphertext: 0x0100000000000000000A9ACD33031BB06E4D87FB3DF10AC943527ED0F06AEFFBF433422C01010000000100000000505636405E89E0F1E7EA445CF296F3B7
+}
+
+func Example_decryptReader() {
+	// Production setup (for reference):
+	//	cipherReader, err := os.Open("report.txt.enc")
+	//	...
+	//	root, mat := store.EnsureDescriptor(...)
+	//	reader, _ := kg.DecryptReader(cipherReader, mat)
+	//	io.Copy(dst, reader)
+
+	root, mat := deterministicMaterial("file-read")
+	kg := New(root)
+
+	var ciphertext bytes.Buffer
+	writer, err := kg.EncryptWriter(&ciphertext, mat)
+	if err != nil {
+		panic(err)
+	}
+	io.WriteString(writer, "Decrypt me")
+	writer.Close()
+
+	reader, err := kg.DecryptReader(bytes.NewReader(ciphertext.Bytes()), mat)
+	if err != nil {
+		panic(err)
+	}
+	var plaintext bytes.Buffer
+	if _, err := io.Copy(&plaintext, reader); err != nil {
+		panic(err)
+	}
+	reader.Close()
+
+	fmt.Printf("Ciphertext: 0x%X\n", ciphertext.Bytes())
+	fmt.Printf("Plaintext: %s\n", plaintext.String())
+
+	// Output:
+	// Ciphertext: 0x0100000000000000000A29EB79EE4C56033A5FA24CCA7263883BEAD8D635D915D09C270D0101000000010000000057CEC8B4B3D63DB6C85D5E7997CA2DE3
+	// Plaintext: Decrypt me
+}
+
+func Example_storeEnsureDescriptor() {
+	// Production setup:
+	//	store, err := Load("bundle.pem")
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	root, err := store.EnsureRootKey()
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	ensured, err := store.EnsureDescriptor("LOCKD", root, []byte("lockd"))
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	if err := store.Commit(); err != nil {
+	//		panic(err)
+	//	}
+
+	root, mat := deterministicMaterial("lockd")
+
+	bundle := keymgmt.NewProtoBundle()
+	bundle.SetRootKey(root)
+	bundle.SetDescriptor("LOCKD", mat.Descriptor)
+	data, _ := bundle.Marshal()
+
+	store, _ := keymgmt.LoadProto(data)
+	ensured, _ := store.EnsureDescriptor("LOCKD", root, []byte("lockd"))
+
+	fmt.Printf("nonce bytes: %d\n", ensured.Descriptor.NonceBytes())
+	fmt.Printf("salt prefix: %X\n", ensured.Descriptor.Salt[:2])
+
+	// Output:
+	// nonce bytes: 12
+	// salt prefix: 0000
+}
+
+func Example_materialHex() {
+	// Production usage:
+	//	mat, err := kg.MintDEK([]byte("ctx"))
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//	fmt.Println(mat.Key.EncodeToHex())
+	//	descHex, _ := mat.Descriptor.EncodeToHex()
+	//	fmt.Println(descHex)
+
+	_, mat := deterministicMaterial("hex-demo")
+
+	fmt.Println(mat.Key.EncodeToHex())
+	descHex, _ := mat.Descriptor.EncodeToHex()
+	fmt.Println(descHex[:16])
+
+	// Output:
+	// dc595e5d77837557370d30b8a183f2a93a32320b2bce48b2da7c1aa8391d2610
+	// 02010cd81b7a9377
+}
+
+func TestKryptografRoundTrip(t *testing.T) {
+	root, err := GenerateRootKey()
+	if err != nil {
+		t.Fatalf("GenerateRootKey error: %v", err)
+	}
+
+	kg := New(root).WithChunkSize(32 * 1024)
+	mat, err := kg.MintDEK([]byte("roundtrip"))
+	if err != nil {
+		t.Fatalf("MintDEK error: %v", err)
+	}
+
+	var buf bytes.Buffer
+	writer, err := kg.EncryptWriter(&buf, mat)
+	if err != nil {
+		t.Fatalf("EncryptWriter error: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte("kryptograf "), 1024)
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	recovered, err := kg.ReconstructDEK([]byte("roundtrip"), mat.Descriptor)
+	if err != nil {
+		t.Fatalf("ReconstructDEK error: %v", err)
+	}
+
+	reader, err := kg.DecryptReader(bytes.NewReader(buf.Bytes()), recovered)
+	if err != nil {
+		t.Fatalf("DecryptReader error: %v", err)
+	}
+	defer reader.Close()
+
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+
+	if !bytes.Equal(out, payload) {
+		t.Fatalf("payload mismatch after roundtrip")
 	}
 }
 
-func TestKryptograf_SetEncryptionKey(t *testing.T) {
-	newKey := kryptograf.NewKey()
-	binKey, err := kryptograf.ToBinaryEncryptionKey(newKey)
+func TestKryptografPipes(t *testing.T) {
+	root, err := GenerateRootKey()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("GenerateRootKey error: %v", err)
 	}
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(newKey)
+	kg := New(root).WithGzip()
+
+	mat, err := kg.MintDEK([]byte("pipes"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("MintDEK error: %v", err)
 	}
-	if bytes.Compare(k.GetEncryptionKey(), binKey) != 0 {
-		t.Errorf("%x does not match %x", k.GetEncryptionKey(), newKey)
+
+	cipherReader, plainWriter, err := kg.NewEncryptPipe(mat)
+	if err != nil {
+		t.Fatalf("NewEncryptPipe error: %v", err)
+	}
+	defer cipherReader.Close()
+
+	go func() {
+		defer plainWriter.Close()
+		_, _ = plainWriter.Write(bytes.Repeat([]byte("stream"), 4096))
+	}()
+
+	decryptedReader, cipherWriter, err := kg.NewDecryptPipe(mat)
+	if err != nil {
+		t.Fatalf("NewDecryptPipe error: %v", err)
+	}
+	defer decryptedReader.Close()
+
+	go func() {
+		defer cipherWriter.Close()
+		_, _ = io.Copy(cipherWriter, cipherReader)
+	}()
+
+	got, err := io.ReadAll(decryptedReader)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+
+	if len(got) == 0 {
+		t.Fatalf("expected plaintext from decrypt pipe")
 	}
 }
 
-func TestKryptograf_EnableGzip(t *testing.T) {
-	k := kryptograf.NewKryptograf().EnableGzip()
-	if !k.Gzip() {
-		t.Error("gzip is turned off when it should be on")
+func TestKryptografWithChaChaCipher(t *testing.T) {
+	root, err := GenerateRootKey()
+	if err != nil {
+		t.Fatalf("GenerateRootKey error: %v", err)
 	}
-	k.DisableGzip()
-	if k.Gzip() {
-		t.Error("gzip is turned on when it should be off")
+	kg := New(root)
+
+	mat, err := kg.MintDEK([]byte("chacha-root"))
+	if err != nil {
+		t.Fatalf("MintDEK error: %v", err)
+	}
+
+	var buf bytes.Buffer
+	writer, err := kg.EncryptWriter(&buf, mat, WithCipher(cipher.ChaCha20Poly1305()))
+	if err != nil {
+		t.Fatalf("EncryptWriter error: %v", err)
+	}
+	if _, err := writer.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	reader, err := kg.DecryptReader(bytes.NewReader(buf.Bytes()), mat, WithCipher(cipher.ChaCha20Poly1305()))
+	if err != nil {
+		t.Fatalf("DecryptReader error: %v", err)
+	}
+	defer reader.Close()
+
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if string(out) != "hello" {
+		t.Fatalf("unexpected plaintext: %s", string(out))
 	}
 }
 
-func TestKryptograf_Encrypt(t *testing.T) {
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(kryptograf.NewKey())
+func TestKryptografWithChaChaPerFrame(t *testing.T) {
+	root, err := GenerateRootKey()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("GenerateRootKey error: %v", err)
 	}
-	testData := []bool{false, true}
-	for _, doGzip := range testData {
-		if doGzip {
-			k.EnableGzip()
-		}
-		msg := "Hello world"
-		ciphertext, err := k.Encrypt([]byte(msg))
+	kg := New(root)
+
+	mat, err := kg.MintDEK([]byte("chacha-pf"))
+	if err != nil {
+		t.Fatalf("MintDEK error: %v", err)
+	}
+
+	var buf bytes.Buffer
+	writer, err := kg.EncryptWriter(&buf, mat, WithCipher(cipher.ChaCha20Poly1305PerFrame()))
+	if err != nil {
+		t.Fatalf("EncryptWriter error: %v", err)
+	}
+	if _, err := writer.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	reader, err := kg.DecryptReader(bytes.NewReader(buf.Bytes()), mat, WithCipher(cipher.ChaCha20Poly1305PerFrame()))
+	if err != nil {
+		t.Fatalf("DecryptReader error: %v", err)
+	}
+	defer reader.Close()
+
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if string(out) != "hello" {
+		t.Fatalf("unexpected plaintext: %s", string(out))
+	}
+}
+
+func TestKryptografWithXChaChaCipher(t *testing.T) {
+	root, err := GenerateRootKey()
+	if err != nil {
+		t.Fatalf("GenerateRootKey error: %v", err)
+	}
+	kg := New(root)
+
+	mat, err := kg.MintDEKWithNonceSize([]byte("xchacha"), 24)
+	if err != nil {
+		t.Fatalf("MintDEKWithNonceSize error: %v", err)
+	}
+
+	var buf bytes.Buffer
+	writer, err := kg.EncryptWriter(&buf, mat, WithCipher(cipher.XChaCha20Poly1305()))
+	if err != nil {
+		t.Fatalf("EncryptWriter error: %v", err)
+	}
+	if _, err := writer.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	reader, err := kg.DecryptReader(bytes.NewReader(buf.Bytes()), mat, WithCipher(cipher.XChaCha20Poly1305()))
+	if err != nil {
+		t.Fatalf("DecryptReader error: %v", err)
+	}
+	defer reader.Close()
+
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if string(out) != "hello" {
+		t.Fatalf("unexpected plaintext: %s", string(out))
+	}
+}
+
+func TestKryptografWithCompressionAdapters(t *testing.T) {
+	root, err := GenerateRootKey()
+	if err != nil {
+		t.Fatalf("GenerateRootKey error: %v", err)
+	}
+
+	adapters := []struct {
+		name   string
+		option StreamOption
+	}{
+		{"gzip", WithGzip()},
+		{"snappy", WithSnappy()},
+		{"lz4", WithLZ4()},
+	}
+
+	payload := []byte("kryptograf compression")
+
+	for _, tc := range adapters {
+		kg := New(root).WithOptions(tc.option)
+		mat, err := kg.MintDEK([]byte("cmp-" + tc.name))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("MintDEK error: %v", err)
 		}
-		t.Logf("gzip=%t length=%d key=%x ciphertext=%x", k.Gzip(), len(ciphertext), k.GetEncryptionKey(), ciphertext)
-		plaintext, err := k.Decrypt(ciphertext)
+
+		var buf bytes.Buffer
+		writer, err := kg.EncryptWriter(&buf, mat)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("EncryptWriter error: %v", err)
 		}
-		if bytes.Compare([]byte(msg), plaintext) != 0 {
-			t.Errorf("%q does not match %q", []byte(msg), plaintext)
+		if _, err := writer.Write(payload); err != nil {
+			t.Fatalf("Write error: %v", err)
 		}
-	}
-}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("Close error: %v", err)
+		}
 
-func TestKryptograf_Decrypt(t *testing.T) {
-	uncoveredMessage := "Hello world"
-	binKey, err := hex.DecodeString(`974089a82b9602c69d53707d59a7be56e4095af0f958a61078879bc84e7bdab8`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	base64key := base64.RawStdEncoding.EncodeToString(binKey)
-	ciphertext, err := hex.DecodeString(`1c053a1041a4346c50ab7b124f6731f30c93c428ebf622d92c272d4661cc67b0c5a7b8a9728395a19514e7fe76a3dd7a91238f6d39e753a0624028`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(base64key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plaintext, err := k.Decrypt(ciphertext)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Compare(plaintext, []byte(uncoveredMessage)) != 0 {
-		t.Errorf("%q does not match %q", []byte(uncoveredMessage), plaintext)
-	}
-}
-
-func TestEncrypt(t *testing.T) {
-	encTestFunc := func(key []byte, data []byte) {
-		t.Logf("Testing %d bytes long key", len(key))
-		mac := hmac.New(sha256.New, key)
-		block, err := aes.NewCipher(key)
+		reader, err := kg.DecryptReader(bytes.NewReader(buf.Bytes()), mat)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("DecryptReader error: %v", err)
 		}
-		if aes.BlockSize != block.BlockSize() {
-			t.Errorf("aes.BlockSize != block.BlockSize(), but %d and %d respectively", aes.BlockSize, block.BlockSize())
-		}
-		t.Logf("mac.Size() = %d", mac.Size())
-		t.Logf("aes.BlockSize = %d", aes.BlockSize)
-		t.Logf("block.BlockSize = %d", block.BlockSize())
-		encrypted, err := kryptograf.Encrypt(key, data)
+		data, err := io.ReadAll(reader)
+		reader.Close()
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("ReadAll error: %v", err)
 		}
-		if len(encrypted) < mac.Size()+aes.BlockSize {
-			t.Fatalf("length of enciphered data is less than mac.Size()+aes.BlockSize (want>%d, got %d)", mac.Size()+aes.BlockSize, len(encrypted))
-		}
-		// Get HMAC from cipher-text
-		encryptedHMAC := encrypted[:mac.Size()]
-		message := encrypted[mac.Size():]
-		//iv := encrypted[mac.Size() : mac.Size()+aes.BlockSize]
-		//cipherText := encrypted[mac.Size()+aes.BlockSize:]
-		if _, err := mac.Write(message); err != nil {
-			t.Fatal(err)
-		}
-		if !hmac.Equal(encryptedHMAC, mac.Sum(nil)) {
-			t.Fatal(kryptograf.ErrHMACValidationFailed)
-		}
-		// Decrypt must also work
-		decrypted, err := kryptograf.Decrypt(key, encrypted)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(data, decrypted) {
-			t.Logf("origidata=%v", data)
-			t.Logf("decrypted=%v", decrypted)
-			t.Fatal("original data and decrypted data (from encryption) does not match")
-		}
-	}
-
-	key, err := kryptograf.ToBinaryEncryptionKey(kryptograf.NewKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(key) != 32 {
-		t.Fatalf("expected NewKey() to produce a 32 byte long key, but got %d bytes", len(key))
-	}
-
-	data := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
-	keys := [][]byte{key, key[:24], key[:16]}
-	for _, k := range keys {
-		encTestFunc(k, data)
-	}
-}
-
-func TestDecrypt(t *testing.T) {
-	decrypTestFunc := func(key []byte, data []byte) {
-		t.Logf("Testing %d bytes long key", len(key))
-		mac := hmac.New(sha256.New, key)
-		if len(data) < mac.Size()+aes.BlockSize {
-			t.Fatalf("length of cipher data is less than mac.Size()+aes.BlockSize (want>%d, got %d)", mac.Size()+aes.BlockSize, len(data))
-		}
-		messageWithIV := data[mac.Size():]
-		t.Logf("mac.Size() == %d", mac.Size())
-		t.Logf("data is %d bytes long, w/o HMAC == %d", len(data), len(messageWithIV))
-		messageHMAC := data[:mac.Size()]
-		if _, err := mac.Write(messageWithIV); err != nil {
-			t.Fatal(err)
-		}
-		if !hmac.Equal(messageHMAC, mac.Sum(nil)) {
-			t.Fatal(kryptograf.ErrHMACValidationFailed)
-		}
-	}
-
-	data := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
-	key, err := kryptograf.ToBinaryEncryptionKey(kryptograf.NewKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, k := range [][]byte{key, key[:24], key[:16]} {
-		ciphered, err := kryptograf.Encrypt(k, data)
-		if err != nil {
-			t.Fatal(err)
-		}
-		decrypTestFunc(k, ciphered)
-	}
-}
-
-func TestKryptograf_Recv(t *testing.T) {
-	testData := []string{"Hello world", "Message number 2 is a bit longer."}
-	k := kryptograf.NewKryptograf()
-	for _, msg := range testData {
-		ciphertext, err := k.Encrypt([]byte(msg))
-		if err != nil {
-			t.Fatal(err)
-		}
-		plaintext, err := k.Recv(bytes.NewReader(ciphertext))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if bytes.Compare(plaintext, []byte(msg)) != 0 {
-			t.Errorf("%q does not match %q", []byte(msg), plaintext)
+		if !bytes.Equal(data, payload) {
+			t.Fatalf("%s: data mismatch", tc.name)
 		}
 	}
 }
 
-func TestKryptograf_Send(t *testing.T) {
-	var output bytes.Buffer
-	k := kryptograf.NewKryptograf()
-	msg := []byte("Hello world, sent to the third ball from the sun.")
-	if err := k.Send(msg, &output); err != nil {
-		t.Fatal(err)
-	}
-	plaintext, err := k.Recv(&output)
+func TestKryptografWithAESGCMSIV(t *testing.T) {
+	root, err := GenerateRootKey()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("GenerateRootKey error: %v", err)
 	}
-	if bytes.Compare(msg, plaintext) != 0 {
-		t.Errorf("%q does not equal %q", output.Bytes(), msg)
+	kg := New(root)
+
+	mat, err := kg.MintDEK([]byte("siv"))
+	if err != nil {
+		t.Fatalf("MintDEK error: %v", err)
+	}
+
+	var buf bytes.Buffer
+	writer, err := kg.EncryptWriter(&buf, mat, WithCipher(cipher.AESGCMSIV()))
+	if err != nil {
+		t.Fatalf("EncryptWriter error: %v", err)
+	}
+	if _, err := writer.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	reader, err := kg.DecryptReader(bytes.NewReader(buf.Bytes()), mat, WithCipher(cipher.AESGCMSIV()))
+	if err != nil {
+		t.Fatalf("DecryptReader error: %v", err)
+	}
+	defer reader.Close()
+
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if string(out) != "hello" {
+		t.Fatalf("unexpected plaintext: %s", string(out))
 	}
 }
 
-func TestKryptograf_EncryptToString(t *testing.T) {
-	msg := "Hello world; that is the message sent to the third sphere from the sun."
-	k := kryptograf.NewKryptograf()
-	str, err := k.EncryptToString([]byte(msg))
+func TestEnsureRootKey(t *testing.T) {
+	var blob []byte
+	store, err := keymgmt.LoadProtoInto([]byte(nil), &blob)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("LoadProtoInto error: %v", err)
 	}
-	byts, err := k.DecryptString(str)
+
+	root, err := store.EnsureRootKey()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("EnsureRootKey error: %v", err)
 	}
-	if bytes.Compare([]byte(msg), byts) != 0 {
-		t.Errorf("expected %q, but got %q", msg, byts)
+	if root == (RootKey{}) {
+		t.Fatalf("expected root key to be generated")
+	}
+
+	if err := store.Commit(); err != nil {
+		t.Fatalf("Commit error after mint: %v", err)
+	}
+	if len(blob) == 0 {
+		t.Fatalf("expected blob to contain data after commit")
+	}
+
+	prev := slices.Clone(blob)
+	existing, err := store.EnsureRootKey()
+	if err != nil {
+		t.Fatalf("EnsureRootKey existing error: %v", err)
+	}
+	if existing != root {
+		t.Fatalf("expected existing root to match original")
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatalf("Commit error without changes: %v", err)
+	}
+	if !bytes.Equal(blob, prev) {
+		t.Fatalf("expected no additional write when root already present")
 	}
 }
 
-func TestKryptograf_DecryptString(t *testing.T) {
-	ciphertextString := `2RvkTt3QhJpN3gcRLXsJsBIlaqoXc8PoqAxSOleYu+mN4UihC1eSiGDYid9HFFhGgNFpKcS5zcc2bMFPJYaKz6O+QTg3MAyVBeIb4xbd8Cxp15rjk2keVbUfUUTRss368r8xYamQu2YoVsLzTDRvfW0eajYudIQ`
-	expectedString := "Hello world; that is the message sent to the third sphere from the sun."
-	k := kryptograf.NewKryptograf()
-	plaintext, err := k.DecryptString(ciphertextString)
+func TestEnsureDescriptor(t *testing.T) {
+	var blob []byte
+	store, err := keymgmt.LoadProtoInto([]byte(nil), &blob)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("LoadProtoInto error: %v", err)
 	}
-	if bytes.Compare([]byte(expectedString), plaintext) != 0 {
-		t.Errorf("expected %q, but got %q", expectedString, plaintext)
+
+	root, err := store.EnsureRootKey()
+	if err != nil {
+		t.Fatalf("EnsureRootKey error: %v", err)
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatalf("Commit root error: %v", err)
+	}
+
+	context := []byte("locker")
+	mat1, err := store.EnsureDescriptor("LOCKD", root, context)
+	if err != nil {
+		t.Fatalf("EnsureDescriptor mint error: %v", err)
+	}
+	if mat1.Descriptor.NonceSize == 0 {
+		t.Fatalf("expected descriptor nonce size to be set")
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatalf("Commit descriptor error: %v", err)
+	}
+	if len(blob) == 0 {
+		t.Fatalf("expected blob to contain descriptor data")
+	}
+
+	prev := slices.Clone(blob)
+	mat2, err := store.EnsureDescriptor("LOCKD", root, context)
+	if err != nil {
+		t.Fatalf("EnsureDescriptor existing error: %v", err)
+	}
+	if mat2.Descriptor != mat1.Descriptor {
+		t.Fatalf("expected descriptor to match stored value")
+	}
+	if mat2.Key != mat1.Key {
+		t.Fatalf("expected reconstructed DEK to match original")
+	}
+	if err := store.Commit(); err != nil {
+		t.Fatalf("Commit without descriptor changes error: %v", err)
+	}
+	if !bytes.Equal(blob, prev) {
+		t.Fatalf("expected no additional write when descriptor already present")
 	}
 }
 
-func TestKryptograf_RecvFromJson(t *testing.T) {
-	testJsonSingle := `{"msg1":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}`
+func TestCertificateIDsFromPEM(t *testing.T) {
+	certDER, pemData := generateTestCertificate(t)
+	expected := sha256.Sum256(certDER)
 
-	testJsonMultiple :=
-		`{"msg1":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg2":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg3":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg4":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg5":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg6":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n"
-
-	uncoveredMessage := "Hello world"
-
-	binKey, err := hex.DecodeString(`974089a82b9602c69d53707d59a7be56e4095af0f958a61078879bc84e7bdab8`)
+	ids, err := CertificateIDsFromPEM(pemData)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CertificateIDsFromPEM error: %v", err)
 	}
-	base64key := base64.RawStdEncoding.EncodeToString(binKey)
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(base64key)
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 certificate, got %d", len(ids))
+	}
+	if ids[0] != hex.EncodeToString(expected[:]) {
+		t.Fatalf("unexpected certificate ID: %s", ids[0])
+	}
+
+	idsReader, err := CertificateIDsFromReader(bytes.NewReader(pemData))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CertificateIDsFromReader error: %v", err)
+	}
+	if len(idsReader) != 1 || idsReader[0] != ids[0] {
+		t.Fatalf("reader IDs mismatch")
 	}
 
-	messages := make(map[string][]byte)
-
-	j := json.NewDecoder(strings.NewReader(testJsonSingle))
-	for {
-		kv, err := k.RecvFromJson(j, true)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatal(err)
-		}
-		for key, val := range kv {
-			messages[key] = val
-		}
+	// Ensure non-certificate blocks are ignored.
+	dataWithExtras := slices.Clone(pemData)
+	dataWithExtras = append(dataWithExtras, []byte("-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")...)
+	idsExtra, err := CertificateIDsFromPEM(dataWithExtras)
+	if err != nil {
+		t.Fatalf("CertificateIDsFromPEM with extras error: %v", err)
 	}
-	if len(messages) != 1 {
-		t.Errorf("expected one key in map, got %d keys", len(messages))
-	}
-	if bytes.Compare(messages["msg1"], []byte(uncoveredMessage)) != 0 {
-		t.Errorf("%x does not equal %x", messages["msg1"], []byte(uncoveredMessage))
-	}
-
-	j = json.NewDecoder(strings.NewReader(testJsonMultiple))
-	for {
-		kv, err := k.RecvFromJson(j, true)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatal(err)
-		}
-		for key, val := range kv {
-			messages[key] = val
-		}
-	}
-	if len(messages) != 6 {
-		t.Errorf("expected 6 keys in map, got %d", len(messages))
-	}
-	for key, plaintext := range messages {
-		switch key {
-		case "msg1", "msg2", "msg3", "msg4", "msg5", "msg6":
-		default:
-			t.Errorf("expected keys msg1-6, but got %q", key)
-		}
-		if bytes.Compare(plaintext, []byte(uncoveredMessage)) != 0 {
-			t.Errorf("%x does not equal %x", plaintext, []byte(uncoveredMessage))
-		}
+	if len(idsExtra) != 1 || idsExtra[0] != ids[0] {
+		t.Fatalf("expected extra data to be ignored")
 	}
 }
 
-func TestKryptograf_EncryptToJson(t *testing.T) {
-	uncoveredMessage := "Hello world"
-	testMessages := make(map[string][]byte)
-	testMessages["msg1"] = []byte(uncoveredMessage + " 1")
-	testMessages["msg2"] = []byte(uncoveredMessage + " 2")
-	testMessages["msg3"] = []byte(uncoveredMessage + " 3")
+func TestCertificateIDsFromFile(t *testing.T) {
+	_, pemData := generateTestCertificate(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bundle.pem")
+	if err := os.WriteFile(path, pemData, 0o600); err != nil {
+		t.Fatalf("WriteFile error: %v", err)
+	}
 
-	binKey, err := hex.DecodeString(`974089a82b9602c69d53707d59a7be56e4095af0f958a61078879bc84e7bdab8`)
+	ids, err := CertificateIDsFromFile(path)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CertificateIDsFromFile error: %v", err)
 	}
-	base64key := base64.RawStdEncoding.EncodeToString(binKey)
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(base64key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var output bytes.Buffer
-	if err := k.EncryptToJson(testMessages, &output); err != nil {
-		t.Fatal(err)
-	}
-
-	plaintextMessages := make(map[string][]byte)
-	j := json.NewDecoder(bytes.NewReader(output.Bytes()))
-	for {
-		msg, err := k.RecvFromJson(j, true)
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatal(err)
-		}
-		for key, val := range msg {
-			plaintextMessages[key] = val
-		}
-	}
-
-	if len(plaintextMessages) != 3 {
-		t.Errorf("expected 3 keys in the output, but got %d", len(plaintextMessages))
-	}
-
-	for i := 0; i < len(plaintextMessages); i++ {
-		key := fmt.Sprintf("msg%d", i+1)
-		msg := []byte(fmt.Sprintf("Hello world %d", i+1))
-		if bytes.Compare(plaintextMessages[key], msg) != 0 {
-			t.Errorf("value of key %q is %q, expected %q", key, plaintextMessages[key], msg)
-		}
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 certificate, got %d", len(ids))
 	}
 }
 
-func TestKryptograf_RecvFunc(t *testing.T) {
-	testJsonSingle := `{"msg1":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}`
+func generateTestCertificate(t *testing.T) ([]byte, []byte) {
+	t.Helper()
 
-	testJsonMultiple :=
-		`{"msg1":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg2":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg3":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg4":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg5":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n" +
-			`{"msg6":"HAU6EEGkNGxQq3sST2cx8wyTxCjr9iLZLCctRmHMZ7DFp7ipcoOVoZUU5/52o916kSOPbTnnU6BiQCg="}` + "\n"
-
-	uncoveredMessage := "Hello world"
-
-	binKey, err := hex.DecodeString(`974089a82b9602c69d53707d59a7be56e4095af0f958a61078879bc84e7bdab8`)
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("rsa.GenerateKey error: %v", err)
 	}
-	base64key := base64.RawStdEncoding.EncodeToString(binKey)
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(base64key)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName:   "kryptograf test",
+			Organization: []string{"pkt.systems"},
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CreateCertificate error: %v", err)
 	}
 
-	if err := k.RecvFunc(strings.NewReader(testJsonSingle), func(key string, plaintext []byte, err error) error {
-		if got, expected := key, "msg1"; got != expected {
-			t.Errorf("Expected key %q, got %q", expected, got)
-		}
-		if got, expected := plaintext, []byte(uncoveredMessage); bytes.Compare(got, expected) != 0 {
-			t.Errorf("Expected %v, got %v", expected, got)
-		}
-		return kryptograf.ErrStop
-	}); err != nil {
-		t.Error(err)
+	var buf bytes.Buffer
+	if err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		t.Fatalf("pem.Encode error: %v", err)
 	}
-
-	testFunc := func(maximum int) {
-		count := 0
-		if err := k.RecvFunc(strings.NewReader(testJsonMultiple), func(key string, plaintext []byte, err error) error {
-			count++
-			t.Log("key:", key, "plaintext:", string(plaintext))
-			if got, expected := key, fmt.Sprintf("msg%d", count); got != expected {
-				t.Errorf("Expected key %q, got %q", expected, got)
-			}
-			if got, expected := plaintext, []byte(uncoveredMessage); bytes.Compare(got, expected) != 0 {
-				t.Errorf("Expected %v, got %v", expected, got)
-			}
-			if count >= maximum {
-				return kryptograf.ErrStop
-			}
-			return nil
-		}); err != nil {
-			t.Error(err)
-		}
-		if got, expected := count, maximum; got != expected {
-			t.Errorf("Expected %d, got %d", expected, got)
-		}
-	}
-
-	testFunc(6)
-	testFunc(3)
-}
-
-func TestKryptograf_SendFunc(t *testing.T) {
-	testJsonSingle := map[string][]byte{
-		"msg1": []byte("Hello world"),
-	}
-
-	testJsonMultiple := map[string][]byte{
-		"msg1": []byte("Hello world one"),
-		"msg2": []byte("Hello world two"),
-		"msg3": []byte("Hello world three"),
-		"msg4": []byte("Hello world four"),
-		"msg5": []byte("Hello world five"),
-		"msg6": []byte("Hello world six"),
-	}
-
-	binKey, err := hex.DecodeString(`974089a82b9602c69d53707d59a7be56e4095af0f958a61078879bc84e7bdab8`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	base64key := base64.RawStdEncoding.EncodeToString(binKey)
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(base64key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	testFunc := func(out io.Writer, input map[string][]byte, maximum int) {
-		count := 0
-		if err := k.SendFunc(out, func() (key string, plaintext []byte, err error) {
-			count++
-			if count > maximum {
-				err = kryptograf.ErrStop
-				return
-			}
-			key = fmt.Sprintf("msg%d", count)
-			plaintext = input[key]
-			return
-		}); err != nil {
-			t.Error(err)
-		}
-	}
-
-	var output1 bytes.Buffer
-	var output2 bytes.Buffer
-	var output3 bytes.Buffer
-	testFunc(&output1, testJsonSingle, 1)
-	testFunc(&output2, testJsonMultiple, 6)
-	testFunc(&output3, testJsonMultiple, 3)
-
-	t.Log("testJsonSingle:", output1.String())
-	t.Log("testJsonMultiple-6:", output2.String())
-	t.Log("testJsonMultiple-3:", output3.String())
-
-	assertFunc := func(in io.Reader, uncovered map[string][]byte, maximum int) {
-		count := 0
-		if err := k.RecvFunc(in, func(key string, plaintext []byte, err error) error {
-			count++
-			t.Log("key:", key, "plaintext:", string(plaintext))
-			if got, expected := key, fmt.Sprintf("msg%d", count); got != expected {
-				t.Errorf("Expected key %q, got %q", expected, got)
-			}
-			if got, expected := plaintext, []byte(uncovered[key]); bytes.Compare(got, expected) != 0 {
-				t.Errorf("Expected %v, got %v", expected, got)
-			}
-			if count >= maximum {
-				return kryptograf.ErrStop
-			}
-			return nil
-		}); err != nil {
-			t.Error(err)
-		}
-		if got, expected := count, maximum; got != expected {
-			t.Errorf("Expected %d, got %d", expected, got)
-		}
-	}
-
-	assertFunc(&output1, testJsonSingle, 1)
-	assertFunc(&output2, testJsonMultiple, 6)
-	assertFunc(&output3, testJsonMultiple, 3)
-
-}
-
-func TestRandomStamp(t *testing.T) {
-	tm := time.Now()
-	rs := []string{
-		kryptograf.RandomStamp(),
-		kryptograf.RandomStamp(),
-		kryptograf.RandomStamp(tm),
-		kryptograf.RandomStamp(tm),
-	}
-	for _, r := range rs {
-		t.Log("RandomStamp:", r)
-		count := 0
-		for _, inner := range rs {
-			if r == inner {
-				count++
-			}
-		}
-		if got, expected := count, 1; got != expected {
-			t.Errorf("Expected %d, got %d matches (not random enough)", expected, got)
-		}
-	}
-}
-
-func TestPersistence_Store(t *testing.T) {
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(kryptograf.DefaultEncryptionKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		defer r.Body.Close()
-		r.Body = io.NopCloser(bytes.NewBuffer(body))
-		if err != nil {
-			t.Log(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write(toJson(Msg{Msg: err.Error()}))
-			return
-		}
-		t.Log(string(body))
-		if err := k.RecvFunc(r.Body, func(key string, plaintext []byte, err error) error {
-			if err == io.EOF {
-				return kryptograf.ErrStop
-			}
-			t.Log("key:", key, "plaintext:", string(plaintext))
-			if got, expected := key, "test"; got != expected {
-				t.Errorf("Expected key %q, got %q", expected, got)
-			}
-			if got, expected := string(plaintext), "Hello world"; got != expected {
-				t.Errorf("Expected string %q, got %q", expected, got)
-			}
-			return nil
-		}); err != nil {
-			t.Log(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write(toJson(Msg{Msg: err.Error()}))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(toJson(Msg{Msg: "OK"}))
-	}))
-
-	//s.URL = "http://localhost:11185"
-
-	p, err := kryptograf.NewPersistenceClient(s.URL, "", k)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := p.Store(context.Background(), "test", []byte("Hello world")); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestPersistence_StoreFunc(t *testing.T) {
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(kryptograf.DefaultEncryptionKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		defer r.Body.Close()
-		r.Body = io.NopCloser(bytes.NewBuffer(body))
-		if err != nil {
-			t.Log(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write(toJson(Msg{Msg: err.Error()}))
-			return
-		}
-		t.Log(string(body))
-		i := 1
-		if err := k.RecvFunc(r.Body, func(key string, plaintext []byte, err error) error {
-			if err == io.EOF {
-				return kryptograf.ErrStop
-			}
-			t.Log("key:", key, "plaintext:", string(plaintext))
-			switch i {
-			case 1:
-				if got, expected := key, "key1"; got != expected {
-					t.Errorf("Expected key %q, got %q", expected, got)
-				}
-				if got, expected := string(plaintext), "Hello world one"; got != expected {
-					t.Errorf("Expected string %q, got %q", expected, got)
-				}
-			case 2:
-				if got, expected := key, "key2"; got != expected {
-					t.Errorf("Expected key %q, got %q", expected, got)
-				}
-				if got, expected := string(plaintext), "Hello world two"; got != expected {
-					t.Errorf("Expected string %q, got %q", expected, got)
-				}
-			case 3:
-				if got, expected := key, "key3"; got != expected {
-					t.Errorf("Expected key %q, got %q", expected, got)
-				}
-				if got, expected := string(plaintext), "Hello world three"; got != expected {
-					t.Errorf("Expected string %q, got %q", expected, got)
-				}
-			default:
-				t.Errorf("Did not expected key %q and plaintext %q", key, string(plaintext))
-			}
-			i++
-			return nil
-		}); err != nil {
-			t.Log(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write(toJson(Msg{Msg: err.Error()}))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write(toJson(Msg{Msg: "OK"}))
-	}))
-
-	//s.URL = "http://localhost:11185"
-
-	p, err := kryptograf.NewPersistenceClient(s.URL, "", k)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ts := []map[string][]byte{
-		{"key1": []byte("Hello world one")},
-		{"key2": []byte("Hello world two")},
-		{"key3": []byte("Hello world three")},
-	}
-	count := 0
-	nextKV := func() (string, []byte, error) {
-		if count >= len(ts) {
-			return "", nil, kryptograf.ErrStop
-		}
-		for k, v := range ts[count] {
-			count++
-			return k, v, nil
-		}
-		return "", nil, errors.New("no key-value pairs")
-	}
-	if err := p.StoreFunc(context.Background(), func() (string, []byte, error) {
-		return nextKV()
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestPersistence_LoadAll(t *testing.T) {
-	testdata := `{"key1":"E1HptIyOYxEu34vkp4MVSBrZyA9/DqhmPtirLjBRlPr/ZQfJ3yaqi4NaTtLuRGxc+4PaPOEVlbl+Dr2pw9qj"} {"key2":"DkF0UmMnLSAqWzPAoOWJWiZV7KDJ2RFhdARaouMTf1CCUhPvWngBYJo04RLrpEGjgKkHn0pIgiQzY2rE5Sv/"}
-{"key3":"Y+G91MdhaRDekq3gWa8RXNIyztM3K8IPfDLNDNaqlpXCvu/phMrAxbiEJwMJ2FS648TegEpnoESZ/ZZCNB0G6Ls="}`
-
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := r.Header.Get("Authorization")
-		if got, expected := token, "Bearer HelloWorld"; got != expected {
-			t.Errorf("Expected Authorization header to be %q, but got %q", expected, got)
-		}
-		defer r.Body.Close()
-		switch r.Method {
-		case http.MethodGet:
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(testdata))
-			return
-		default:
-			t.Errorf("Method %q not supported by test server", r.Method)
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write(toJson(Msg{Msg: "bad request"}))
-			return
-		}
-	}))
-
-	//s.URL = "http://localhost:11185"
-
-	k, err := kryptograf.NewKryptograf().SetEncryptionKey(kryptograf.DefaultEncryptionKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	p, err := kryptograf.NewPersistenceClient(s.URL, "HelloWorld", k)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	gots := []bool{false, false, false}
-	if err := p.LoadAll(context.Background(), func(key string, plaintext []byte, err error) error {
-		if err == io.EOF {
-			return kryptograf.ErrStop
-		}
-		switch key {
-		case "key1":
-			if got, expected := string(plaintext), "Hello world one"; got != expected {
-				t.Errorf("Expected %q, but got %q for %q", expected, got, key)
-			}
-			gots[0] = true
-		case "key2":
-			if got, expected := string(plaintext), "Hello world two"; got != expected {
-				t.Errorf("Expected %q, but got %q for %q", expected, got, key)
-			}
-			gots[1] = true
-		case "key3":
-			if got, expected := string(plaintext), "Hello world three"; got != expected {
-				t.Errorf("Expected %q, but got %q for %q", expected, got, key)
-			}
-			gots[2] = true
-		default:
-			t.Errorf("Did not expect key %q with plaintext %q", key, string(plaintext))
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for i, got := range gots {
-		if !got {
-			t.Errorf("Expected to have gotten result index %d, but it's marked %v", i, got)
-		}
-	}
-}
-
-func TestKeyValueMap_Get(t *testing.T) {
-	kv := kryptograf.KeyValueMap{
-		"key": []byte("value"),
-	}
-	if got, expected := string(kv.Get("key")), "value"; got != expected {
-		t.Errorf("Expected %q, got %q", expected, got)
-	}
-	if got, expected := string(kv.Get("nonexistant")), ""; got != expected {
-		t.Errorf("Expected %q, got %q", expected, got)
-	}
-}
-
-func TestKeyValueMap_Put(t *testing.T) {
-	kv := make(kryptograf.KeyValueMap)
-	if got, expected := string(kv.Get("hello")), ""; got != expected {
-		t.Errorf("Expected %q, got %q", expected, got)
-	}
-
-	if got, expected := kv.Put("hello", []byte("world")), error(nil); got != expected {
-		t.Errorf("Expected err %v, got %v", expected, got)
-	}
-
-	if got, expected := kv.Put("hello", []byte("world")), kryptograf.ErrKeyExists; got != expected {
-		t.Errorf("Expected err %v, got %v", expected, got)
-	}
-
-	if got, expected := string(kv.Get("hello")), "world"; got != expected {
-		t.Errorf("Expected %q, got %q", expected, got)
-	}
-}
-
-func TestKeyValueMap_Delete(t *testing.T) {
-	kv := make(kryptograf.KeyValueMap)
-	if got, expected := kv.Len(), 0; got != expected {
-		t.Errorf("Expected len %d, got %d", expected, got)
-	}
-	if got, expected := kv.Put("hello", []byte("world")), error(nil); got != expected {
-		t.Errorf("Expected err %v, got %v", expected, got)
-	}
-	if got, expected := kv.Put("hello2", []byte("world two")), error(nil); got != expected {
-		t.Errorf("Expected err %v, got %v", expected, got)
-	}
-	if got, expected := string(kv.Get("hello2")), "world two"; got != expected {
-		t.Errorf("Expected %q, got %q", expected, got)
-	}
-	kv.Delete("hello2")
-	if got, expected := string(kv.Get("hello2")), ""; got != expected {
-		t.Errorf("Expected %q, got %q", expected, got)
-	}
-	if got, expected := kv.Len(), 1; got != expected {
-		t.Errorf("Expected %d key, got %d", expected, got)
-	}
-	if got, expected := kv.Put("hello", []byte("world")), kryptograf.ErrKeyExists; got != expected {
-		t.Errorf("Expected err %v, got %v", expected, got)
-	}
-	if got, expected := kv.Put("hello2", []byte("world two")), error(nil); got != expected {
-		t.Errorf("Expected err %v, got %v", expected, got)
-	}
-	if got, expected := kv.Len(), 2; got != expected {
-		t.Errorf("Expected %d keys, got %d", expected, got)
-	}
-	kv.Delete("hello")
-	kv.Delete("hello2")
-	if got, expected := kv.Len(), 0; got != expected {
-		t.Errorf("Expected %d keys, got %d", expected, got)
-	}
-}
-
-func TestKeyValueMap_PutSequential(t *testing.T) {
-	kv := make(kryptograf.KeyValueMap)
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_1"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_2"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_3"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-	kv.Delete("hello_2")
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_2"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-}
-
-func TestKeyValueMap_ForEach(t *testing.T) {
-	kv := make(kryptograf.KeyValueMap)
-
-	if err := kv.ForEach(func(key string, data []byte) error {
-		t.Error("Did not expect to end up here")
-		return errors.New("did not expected to run this code")
-	}); err != nil {
-		t.Error(err)
-	}
-
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_1"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_2"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-	if got, expected := kv.PutSequential("hello", []byte("world")), "hello_3"; got != expected {
-		t.Errorf("Expected to have stored key %q, but got %q", expected, got)
-	}
-
-	if err := kv.ForEach(func(key string, data []byte) error {
-		t.Log("key:", key, "data:", string(data))
-		return nil
-	}); err != nil {
-		t.Error(err)
-	}
-
-	count := 0
-	if err := kv.ForEach(func(key string, data []byte) error {
-		count++
-		return kryptograf.ErrStop
-	}); err != nil {
-		t.Error(err)
-	}
-	if got, expected := count, 1; got != expected {
-		t.Errorf("Expected to have processed %d key-value pair, but got %d", expected, got)
-	}
+	return der, buf.Bytes()
 }

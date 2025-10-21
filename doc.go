@@ -1,0 +1,342 @@
+// Package kryptograf provides streaming encryption middleware for Go services
+// that need to protect data in transit or at rest without sacrificing
+// throughput. The API focuses on streaming primitives so callers can wrap
+// network pipes, file handles, or arbitrary io.Reader/io.Writer implementations
+// without buffering entire payloads.
+//
+// # Features
+//
+//   - Streaming first: wrap any io.Reader, io.Writer, or io.Pipe and process data incrementally.
+//   - Root key / DEK separation: long-lived root keys mint short-lived data-encryption keys (DEKs) via HKDF.
+//   - Compression aware: apply gzip, Snappy, or LZ4 before encryption to retain compression efficiency.
+//   - Pluggable ciphers: swap AES-GCM for ChaCha20-Poly1305 variants, AES-GCM-SIV, or your own adapters.
+//   - Benchmarked: the repository ships with comparisons between raw io.Copy and kryptograf pipelines.
+//
+// # Installation
+//
+//	go get pkt.systems/kryptograf@latest
+//
+// # Quick Start
+//
+//	package main
+//
+//	import (
+//		"bytes"
+//		"fmt"
+//		"io"
+//		"os"
+//		"path/filepath"
+//
+//		"pkt.systems/kryptograf"
+//		"pkt.systems/kryptograf/cipher"
+//		"pkt.systems/kryptograf/keymgmt"
+//	)
+//
+//	func main() {
+//		pemPath := filepath.Join(os.TempDir(), "kryptograf-quickstart.pem")
+//		store, err := kryptograf.LoadPEM(pemPath)
+//		if err != nil {
+//			panic(err)
+//		}
+//		defer os.Remove(pemPath)
+//
+//		contextBytes := []byte("object-42")
+//
+//		root, err := store.EnsureRootKey()
+//		if err != nil {
+//			panic(err)
+//		}
+//
+//		mat, err := store.EnsureDescriptor("object-42", root, contextBytes)
+//		if err != nil {
+//			panic(err)
+//		}
+//
+//		if err := store.Commit(); err != nil {
+//			panic(err)
+//		}
+//
+//		var protoBlob []byte
+//		protoStore, err := keymgmt.LoadProtoInto(nil, &protoBlob)
+//		if err != nil {
+//			panic(err)
+//		}
+//		if err := protoStore.SetDescriptor("object-42", mat.Descriptor); err != nil {
+//			panic(err)
+//		}
+//		if err := protoStore.Commit(); err != nil {
+//			panic(err)
+//		}
+//
+//		kg := kryptograf.New(root).WithSnappy().WithCipher(cipher.AESGCM())
+//
+//		material := mat
+//
+//		var ciphertext bytes.Buffer
+//		writer, err := kg.EncryptWriter(&ciphertext, material)
+//		if err != nil {
+//			panic(err)
+//		}
+//		if _, err := io.Copy(writer, bytes.NewReader([]byte("hello world"))); err != nil {
+//			panic(err)
+//		}
+//		if err := writer.Close(); err != nil {
+//			panic(err)
+//		}
+//
+//		reopened, err := kryptograf.LoadPEM(pemPath)
+//		if err != nil {
+//			panic(err)
+//		}
+//
+//		root2, err := reopened.EnsureRootKey()
+//		if err != nil {
+//			panic(err)
+//		}
+//		mat2, err := reopened.EnsureDescriptor("object-42", root2, contextBytes)
+//		if err != nil {
+//			panic(err)
+//		}
+//
+//		kg = kryptograf.New(root2).WithSnappy().WithCipher(cipher.AESGCM())
+//		reader, err := kg.DecryptReader(bytes.NewReader(ciphertext.Bytes()), mat2)
+//		if err != nil {
+//			panic(err)
+//		}
+//		defer reader.Close()
+//
+//		recovered, err := io.ReadAll(reader)
+//		if err != nil {
+//			panic(err)
+//		}
+//		fmt.Println(string(recovered))
+//	}
+//
+// # Root Keys and DEKs
+//
+// keymgmt.GenerateRootKey returns a 32-byte AES root key. This key never encrypts payloads directly.
+// Instead, bind object-specific DEKs to caller-supplied context bytes (IDs, filenames, tenant identifiers, and so on).
+//
+//	store, _ := kryptograf.LoadPEM("/etc/service/bundle.pem")
+//	context := []byte("tenant-A/files/2025-10-20")
+//	root, _ := store.EnsureRootKey()
+//	mat, _ := store.EnsureDescriptor("metadata", root, context)
+//	store.Commit() // no-op if nothing changed
+//
+//	var protoBlob []byte
+//	protoStore, _ := keymgmt.LoadProtoInto(nil, &protoBlob)
+//	protoStore.SetDescriptor("metadata", mat.Descriptor)
+//	protoStore.Commit()
+//
+//	rootHex := root.EncodeToHex()
+//	root2, _ := keymgmt.RootKeyFromHex(rootHex)
+//	dekHex := mat.Key.EncodeToHex()
+//	dek2, _ := keymgmt.DEKFromHex(dekHex)
+//	descHex, _ := mat.Descriptor.EncodeToHex()
+//	desc2, _ := keymgmt.DescriptorFromHex(descHex)
+//	_ = root2
+//	_ = dek2
+//	_ = desc2
+//
+// To decrypt later, reconstruct the DEK with the same context bytes:
+//
+//	store, _ := kryptograf.LoadPEM("/etc/service/bundle.pem")
+//	root, _ := store.EnsureRootKey()
+//	mat, _ := store.EnsureDescriptor("metadata", root, context)
+//
+// Descriptors expose MarshalBinary/UnmarshalBinary for storage. When AEADs need a nonce length other
+// than the default 12 bytes (for example XChaCha20-Poly1305's 24-byte nonce),
+// derive materials via keymgmt.MintDEKWithNonceSize or the kryptograf.Kryptograf convenience helper:
+//
+//	mat, err := kg.MintDEKWithNonceSize([]byte("stream-id"), 24) // XChaCha20
+//
+// # Certificate Helpers
+//
+//	kryptograf.CertificateIDsFromFile inspects PEM bundles and returns stable identifiers
+//	for each certificate it finds (the SHA-256 hash of the DER payload):
+//
+//	ids, err := kryptograf.CertificateIDsFromFile("/etc/service/ca.pem")
+//	if err != nil {
+//		panic(err)
+//	}
+//	if len(ids) == 0 {
+//		panic("missing certificates")
+//	}
+//	context := []byte(ids[0])
+//	mat, _ := store.EnsureDescriptor("metadata", root, context)
+//
+// # Unified Storage Loaders
+//
+// keymgmt.Load auto-detects whether the payload is PEM or protobuf and returns a store exposing
+// RootKey/Descriptor accessors plus Commit for persistence. Passing a filesystem path creates the file if it
+// does not yet exist and writes it on commit.
+//
+//	store, _ := keymgmt.Load("/etc/service/bundle.pem") // auto-detected as PEM
+//	store.SetRootKey(root)
+//	mat, _ := store.EnsureDescriptor("metadata", root, context)
+//	store.SetDescriptor("metadata", mat.Descriptor)
+//	store.Commit() // writes /etc/service/bundle.pem (0o600) if missing
+//
+//	rootKey, _, _ := store.RootKey()
+//	metadataDescriptor, _, _ := store.Descriptor("metadata")
+//
+// The same API works for protobuf bundles. Provide an existing protobuf byte slice and an output sink to capture updates:
+//
+//	var blob []byte
+//	protoStore, _ := keymgmt.LoadInto(existingProtoBytes, &blob)
+//	protoStore.SetDescriptor("payload", payloadDesc)
+//	protoStore.Commit() // blob now holds the protobuf-encoded bundle
+//
+// Streams are equally supported—supply an io.Reader source and an explicit sink for LoadInto:
+//
+//	reader := bytes.NewReader(existingBundleBytes)
+//	var out bytes.Buffer
+//	store, _ := keymgmt.LoadInto(reader, &out)
+//	store.SetDescriptor("metadata", mat.Descriptor)
+//	store.Commit() // updates are written to out
+//
+// If the format is known ahead of time, LoadPEM, LoadProto, and the *Into variants are available:
+//
+//	store, _ := keymgmt.LoadPEM("/etc/service/bundle.pem")
+//	store.SetDescriptor("metadata", mat.Descriptor)
+//	store.Commit()
+//
+//	protoStore, _ := keymgmt.LoadProto("/var/lib/service/keys.pb")
+//	protoStore.SetDescriptor("payload", payloadDesc)
+//	protoStore.Commit()
+//
+//	var buf []byte
+//	memStore, _ := keymgmt.LoadProtoInto(nil, &buf)
+//	memStore.SetRootKey(root)
+//	memStore.Commit()
+//
+// All loaders share the same semantics: descriptors and root keys are optional, existing PEM certificate
+// and key blocks remain untouched, and missing target files are created on the first commit. The protobuf
+// form is convenient when descriptors need to travel alongside other metadata streams.
+//
+// # Passphrases via PBKDF2
+//
+// Operators who prefer supplying a passphrase can derive the root key with PBKDF2:
+//
+//	passphrase, _ := keymgmt.PromptPassphrase(nil, "Enter passphrase: ", os.Stdout)
+//	root, params, err := keymgmt.DeriveKeyFromPassphrase(passphrase)
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	// Persist params.Salt and params.Iterations alongside the root key.
+//	store, _ := keymgmt.LoadPEM("bundle.pem")
+//	_ = store.SetPBKDF2Params(params)
+//	store.Commit()
+//
+// golang.org/x/term is used internally to disable terminal echo on Linux, macOS, and Windows.
+//
+// # Streaming Utilities
+//
+// Construct pipes to bridge network stacks with minimal boilerplate:
+//
+//	cipherReader, plainWriter, _ := kg.NewEncryptPipe(material)
+//	decryptedReader, cipherWriter, _ := kg.NewDecryptPipe(material)
+//
+//	go func() {
+//		defer plainWriter.Close()
+//		io.Copy(plainWriter, someInput)
+//	}()
+//
+//	go func() {
+//		defer cipherWriter.Close()
+//		io.Copy(cipherWriter, cipherReader)
+//	}()
+//
+//	io.Copy(processor, decryptedReader)
+//
+// WithChunkSize tunes throughput versus latency. Larger chunks reduce frame overhead; smaller chunks lower
+// per-frame latency. Compression can be layered by supplying adapters:
+//
+//	writer, _ := kg.EncryptWriter(dst, material, kryptograf.WithSnappy())
+//	reader, _ := kg.DecryptReader(src, material, kryptograf.WithSnappy())
+//
+// Built-in adapters include pooled gzip (WithGzip), Snappy, and LZ4. Custom adapters can implement
+// compression.Adapter to integrate other codecs or pooling strategies.
+//
+// Encrypting files is just another io.Copy. This example opens a plaintext file, ensures key material, and writes
+// the ciphertext to "report.txt.enc":
+//
+//	inf, err := os.Open("report.txt")
+//	if err != nil {
+//		panic(err)
+//	}
+//	defer inf.Close()
+//
+//	store, err := kryptograf.LoadPEM("/var/lib/kryptograf/keys.pem")
+//	if err != nil {
+//		panic(err)
+//	}
+//	root, err := store.EnsureRootKey()
+//	if err != nil {
+//		panic(err)
+//	}
+//	mat, err := store.EnsureDescriptor("report.txt", root, []byte("report.txt"))
+//	if err != nil {
+//		panic(err)
+//	}
+//	if err := store.Commit(); err != nil {
+//		panic(err)
+//	}
+//
+//	outf, err := os.Create("report.txt.enc")
+//	if err != nil {
+//		panic(err)
+//	}
+//	defer outf.Close()
+//
+//	kg := kryptograf.New(root).WithCipher(cipher.AESGCM())
+//	writer, err := kg.EncryptWriter(outf, mat)
+//	if err != nil {
+//		panic(err)
+//	}
+//	if _, err := io.Copy(writer, inf); err != nil {
+//		panic(err)
+//	}
+//	if err := writer.Close(); err != nil {
+//		panic(err)
+//	}
+//
+// report.txt.enc now holds the encrypted bytes of report.txt.
+//
+// # Choosing Cipher Implementations
+//
+// By default kryptograf uses AES-256-GCM, but you can swap in other AEADs through stream options provided
+// by pkt.systems/kryptograf/cipher. Available factories include:
+//
+//   - cipher.ChaCha20Poly1305() (12-byte nonce)
+//
+//   - cipher.ChaCha20Poly1305PerFrame() (per-frame rekeyed ChaCha20-Poly1305)
+//
+//   - cipher.XChaCha20Poly1305() (24-byte nonce)
+//
+//   - cipher.XChaCha20Poly1305PerFrame() (per-frame rekeyed XChaCha20-Poly1305)
+//
+//   - cipher.AESGCMSIV() (misuse-resistant AES-GCM-SIV)
+//
+//     mat, _ := kg.MintDEKWithNonceSize([]byte("object"), 24)
+//     writer, _ := kg.EncryptWriter(dst, mat, kryptograf.WithCipher(cipher.XChaCha20Poly1305PerFrame()))
+//     reader, _ := kg.DecryptReader(src, mat, kryptograf.WithCipher(cipher.XChaCha20Poly1305PerFrame()))
+//
+// Custom adapters register by implementing cipher.Factory, making it straightforward to experiment with
+// third-party high-performance stream ciphers.
+//
+// # CLI Helper
+//
+// The cmd/newkey helper emits a fresh base64-encoded root key:
+//
+//	go run pkt.systems/kryptograf/cmd/newkey@latest
+//
+// # Benchmarks
+//
+// Run the benchmarks to measure kryptograf overhead relative to raw I/O:
+//
+//	go test ./stream -bench=. -benchtime=1s
+//
+// Benchmarks cover plain copy, encrypt/decrypt, and compression + crypto pipelines. Additional suites live
+// under the benchmark directory and mirror production-style HTTP streaming scenarios.
+package kryptograf

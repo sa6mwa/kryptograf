@@ -2,8 +2,8 @@ package tokenauth
 
 import "net/http"
 
-// Injector is accessed by Injector_RoundTrip to inject an
-// Authorization Bearer token on every HTTP request.
+// Injector wraps an http.RoundTripper to inject an Authorization Bearer token
+// into every HTTP request.
 type Injector struct {
 	Token             string
 	OriginalTransport http.RoundTripper
@@ -18,13 +18,12 @@ func (t *Injector) roundtripper() http.RoundTripper {
 	return http.DefaultTransport
 }
 
-// Implements the http.RoundTripper interface injecting an
-// Authorization: Bearer token header with every http request.
-// Example:
+// RoundTrip implements http.RoundTripper, injecting an Authorization: Bearer
+// token header into every outbound HTTP request. Example:
 //
 //	c := http.Client{}
 //	c.Timeout = 10 * time.Second
-//	c.Transport = &authtoken.Injector{Token: "secret", OriginalTransport: c.Transport}
+//	c.Transport = &tokenauth.Injector{Token: "secret", OriginalTransport: c.Transport}
 func (t *Injector) RoundTrip(r *http.Request) (*http.Response, error) {
 	// Inject Authorization header in all requests
 	r.Header.Set("Authorization", "Bearer "+t.Token)
