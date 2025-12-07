@@ -3,6 +3,7 @@ package kryptograf
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"pkt.systems/kryptograf/cipher"
 	"pkt.systems/kryptograf/compression"
@@ -38,6 +39,9 @@ func WithLZ4() StreamOption { return stream.WithLZ4() }
 func WithCompression(adapter compression.Adapter) StreamOption {
 	return stream.WithCompression(adapter)
 }
+
+// WithBufferPool forwards to stream.WithBufferPool.
+func WithBufferPool(pool *sync.Pool) StreamOption { return stream.WithBufferPool(pool) }
 
 // WithCipher forwards to stream.WithCipher.
 func WithCipher(factory cipher.Factory) StreamOption { return stream.WithCipher(factory) }
@@ -169,7 +173,7 @@ func (s *service) NewEncryptPipe(mat Material, opts ...StreamOption) (*io.PipeRe
 	if mat.Key == (keymgmt.DEK{}) {
 		return nil, nil, fmt.Errorf("kryptograf: material key is empty")
 	}
-	return stream.NewEncryptPipe(mat, s.merge(opts)...) 
+	return stream.NewEncryptPipe(mat, s.merge(opts)...)
 }
 
 // NewDecryptPipe returns a plaintext reader and a writer that accepts ciphertext.
@@ -177,7 +181,7 @@ func (s *service) NewDecryptPipe(mat Material, opts ...StreamOption) (io.ReadClo
 	if mat.Key == (keymgmt.DEK{}) {
 		return nil, nil, fmt.Errorf("kryptograf: material key is empty")
 	}
-	return stream.NewDecryptPipe(mat, s.merge(opts)...) 
+	return stream.NewDecryptPipe(mat, s.merge(opts)...)
 }
 
 func (s *service) merge(opts []StreamOption) []StreamOption {

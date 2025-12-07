@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sync"
+	"sync/atomic"
 
 	"pkt.systems/kryptograf/cipher"
 	"pkt.systems/kryptograf/compression"
@@ -34,6 +36,8 @@ func NewDecryptReader(src io.Reader, material keymgmt.Material, opts ...Option) 
 		return nil, fmt.Errorf("stream decrypt reader: cipher nonce size %d does not match descriptor size %d", crypt.NonceSize(), len(noncePrefix))
 	}
 
+	buffers, _ := borrowBuffers(cfg, int(crypt.Overhead()))
+
 	r := &reader{
 		src:        src,
 		cipher:     crypt,
@@ -42,8 +46,10 @@ func NewDecryptReader(src io.Reader, material keymgmt.Material, opts ...Option) 
 		headerBuf:  make([]byte, chunkio.FrameHeaderSize),
 		overhead:   crypt.Overhead(),
 		closer:     toCloser(src),
-		ciphertext: make([]byte, 0, cfg.chunkSize+crypt.Overhead()),
-		plaintext:  make([]byte, 0, cfg.chunkSize),
+		ciphertext: buffers.cipher,
+		plaintext:  buffers.plain,
+		bufPool:    cfg.bufferPool,
+		buffers:    buffers,
 	}
 
 	if cfg.compressor != nil {
@@ -66,6 +72,10 @@ type reader struct {
 	overhead   int
 	finalSeen  bool
 	closer     io.Closer
+	closed     atomic.Bool
+
+	bufPool *sync.Pool
+	buffers *bufferSet
 }
 
 func (r *reader) Read(p []byte) (int, error) {
@@ -148,6 +158,10 @@ func (r *reader) fill() error {
 }
 
 func (r *reader) Close() error {
+	if !r.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	releaseBuffers(r.bufPool, r.buffers)
 	if r.closer != nil {
 		return r.closer.Close()
 	}

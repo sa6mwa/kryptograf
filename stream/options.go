@@ -2,6 +2,7 @@ package stream
 
 import (
 	"fmt"
+	"sync"
 
 	"pkt.systems/kryptograf/cipher"
 	"pkt.systems/kryptograf/compression"
@@ -11,6 +12,7 @@ type config struct {
 	chunkSize     int
 	compressor    compression.Adapter
 	cipherFactory cipher.Factory
+	bufferPool    *sync.Pool
 }
 
 const (
@@ -41,6 +43,16 @@ func WithChunkSize(n int) Option {
 			panic(fmt.Sprintf("kryptograf/stream: chunk size must be >= %d", minChunkSize))
 		}
 		cfg.chunkSize = n
+	}
+}
+
+// WithBufferPool allows callers to share chunk buffers across encrypt/decrypt
+// streams to reduce allocations. The pool should store *bufferSet values. The
+// pooled buffers are zeroed before being returned. Passing nil leaves pooling
+// disabled.
+func WithBufferPool(pool *sync.Pool) Option {
+	return func(cfg *config) {
+		cfg.bufferPool = pool
 	}
 }
 

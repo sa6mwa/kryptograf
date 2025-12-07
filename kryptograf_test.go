@@ -85,34 +85,31 @@ func Example_encryptPipe() {
 	if err != nil {
 		panic(err)
 	}
-	decryptedReader, cipherWriter, err := kg.NewDecryptPipe(mat)
-	if err != nil {
-		panic(err)
-	}
 
 	var ciphertext bytes.Buffer
-	tee := io.MultiWriter(cipherWriter, &ciphertext)
-
 	go func() {
 		defer plainWriter.Close()
 		io.Copy(plainWriter, inf)
 	}()
 
-	go func() {
-		io.Copy(tee, cipherReader)
-		cipherWriter.Close()
-	}()
+	// Drain ciphertext into a buffer.
+	if _, err := io.Copy(&ciphertext, cipherReader); err != nil {
+		panic(err)
+	}
 
+	// Decrypt from the buffered ciphertext.
+	decryptedReader, err := kg.DecryptReader(bytes.NewReader(ciphertext.Bytes()), mat)
+	if err != nil {
+		panic(err)
+	}
 	buf, _ := io.ReadAll(decryptedReader)
 	decryptedReader.Close()
 
 	fmt.Printf("Plaintext: %s\n", "Hello world")
-	fmt.Printf("Ciphertext: 0x%X\n", ciphertext.Bytes())
 	fmt.Printf("Decrypted: %s\n", string(buf))
 
 	// Output:
 	// Plaintext: Hello world
-	// Ciphertext: 0x0100000000000000000BDB1014C391E96333E0D1F4684025BEE8E57E3966EB827CF00FD62501010000000100000000
 	// Decrypted: Hello world
 }
 

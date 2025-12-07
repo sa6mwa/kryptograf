@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sync"
+	"sync/atomic"
 
 	"pkt.systems/kryptograf/cipher"
 	"pkt.systems/kryptograf/internal/chunkio"
@@ -33,6 +35,8 @@ func NewEncryptWriter(dst io.Writer, material keymgmt.Material, opts ...Option) 
 		return nil, fmt.Errorf("stream encrypt writer: cipher nonce size %d does not match descriptor size %d", crypt.NonceSize(), len(noncePrefix))
 	}
 
+	buffers, _ := borrowBuffers(cfg, int(crypt.Overhead()))
+
 	w := &writer{
 		dst:        dst,
 		cipher:     crypt,
@@ -40,10 +44,12 @@ func NewEncryptWriter(dst io.Writer, material keymgmt.Material, opts ...Option) 
 		nonceBuf:   make([]byte, len(noncePrefix)),
 		chunkSize:  cfg.chunkSize,
 		headerBuf:  make([]byte, chunkio.FrameHeaderSize),
-		closer:     toCloser(dst),
 		overhead:   crypt.Overhead(),
-		plaintext:  make([]byte, 0, cfg.chunkSize),
-		ciphertext: make([]byte, 0, cfg.chunkSize+int(crypt.Overhead())),
+		plaintext:  buffers.plain,
+		ciphertext: buffers.cipher,
+		closer:     toCloser(dst),
+		bufPool:    cfg.bufferPool,
+		buffers:    buffers,
 	}
 
 	if cfg.compressor != nil {
@@ -70,8 +76,12 @@ type writer struct {
 	overhead   int
 	closer     io.Closer
 	closed     bool
+	closedFlag atomic.Bool
 
 	compressor io.WriteCloser
+
+	bufPool *sync.Pool
+	buffers *bufferSet
 }
 
 func (w *writer) Write(p []byte) (int, error) {
@@ -118,7 +128,7 @@ func (w *writer) writePlain(p []byte) (int, error) {
 }
 
 func (w *writer) Close() error {
-	if w.closed {
+	if !w.closedFlag.CompareAndSwap(false, true) {
 		return nil
 	}
 
@@ -141,6 +151,8 @@ func (w *writer) Close() error {
 	}
 
 	w.closed = true
+
+	releaseBuffers(w.bufPool, w.buffers)
 
 	if w.closer != nil {
 		if err := w.closer.Close(); err != nil {

@@ -3,6 +3,8 @@ package stream
 import (
 	"bytes"
 	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"pkt.systems/kryptograf/cipher"
@@ -211,6 +213,108 @@ func TestEncryptDecryptWithChaChaPerFrame(t *testing.T) {
 	}
 	if string(out) != "hello chacha per frame" {
 		t.Fatalf("unexpected plaintext: %s", string(out))
+	}
+}
+
+func TestEncryptWriterReturnsBuffersToPool(t *testing.T) {
+	pool := sync.Pool{}
+	bufs := &bufferSet{
+		plain:  make([]byte, 0, 2048),
+		cipher: make([]byte, 0, 2048+16),
+	}
+	pool.Put(bufs)
+	atomic.StoreUint32(&bufs.inUse, 0)
+
+	root, _ := keymgmt.GenerateRootKey()
+	mat, err := keymgmt.MintDEK(root, []byte("pool-writer"))
+	if err != nil {
+		t.Fatalf("MintDEK error: %v", err)
+	}
+	var dst bytes.Buffer
+	writer, err := NewEncryptWriter(&dst, mat, WithChunkSize(1024), WithBufferPool(&pool))
+	if err != nil {
+		t.Fatalf("NewEncryptWriter error: %v", err)
+	}
+	if _, err := writer.Write([]byte("pool data")); err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close error: %v", err)
+	}
+
+	got := pool.Get()
+	if got == nil {
+		t.Skip("pool entry reclaimed by GC; cannot assert reuse")
+	}
+	bs, ok := got.(*bufferSet)
+	if !ok {
+		t.Fatalf("expected *bufferSet from pool, got %T", got)
+	}
+	if len(bs.plain) != 0 || len(bs.cipher) != 0 {
+		t.Fatalf("expected buffers to be reset")
+	}
+	for _, v := range bs.plain[:cap(bs.plain)] {
+		if v != 0 {
+			t.Fatalf("plaintext buffer not zeroed")
+		}
+	}
+	for _, v := range bs.cipher[:cap(bs.cipher)] {
+		if v != 0 {
+			t.Fatalf("ciphertext buffer not zeroed")
+		}
+	}
+}
+
+func TestDecryptReaderReturnsBuffersToPool(t *testing.T) {
+	pool := sync.Pool{}
+	bufs := &bufferSet{
+		plain:  make([]byte, 0, 2048),
+		cipher: make([]byte, 0, 2048+16),
+	}
+	pool.Put(bufs)
+
+	root, _ := keymgmt.GenerateRootKey()
+	mat, err := keymgmt.MintDEK(root, []byte("pool-reader"))
+	if err != nil {
+		t.Fatalf("MintDEK error: %v", err)
+	}
+
+	var cipherBuf bytes.Buffer
+	w, err := NewEncryptWriter(&cipherBuf, mat, WithChunkSize(1024))
+	if err != nil {
+		t.Fatalf("NewEncryptWriter error: %v", err)
+	}
+	w.Write([]byte("pool data reader"))
+	w.Close()
+
+	r, err := NewDecryptReader(bytes.NewReader(cipherBuf.Bytes()), mat, WithChunkSize(1024), WithBufferPool(&pool))
+	if err != nil {
+		t.Fatalf("NewDecryptReader error: %v", err)
+	}
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	got := pool.Get()
+	if got == nil {
+		t.Skip("pool entry reclaimed by GC; cannot assert reuse")
+	}
+	bs, ok := got.(*bufferSet)
+	if !ok {
+		t.Fatalf("expected *bufferSet from pool, got %T", got)
+	}
+	for _, v := range bs.plain[:cap(bs.plain)] {
+		if v != 0 {
+			t.Fatalf("plaintext buffer not zeroed")
+		}
+	}
+	for _, v := range bs.cipher[:cap(bs.cipher)] {
+		if v != 0 {
+			t.Fatalf("ciphertext buffer not zeroed")
+		}
 	}
 }
 
