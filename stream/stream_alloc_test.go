@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -145,6 +146,73 @@ func TestBufferPoolIgnoresWrongType(t *testing.T) {
 	}
 }
 
+func TestDecryptReaderAllocsWithSourceReadBufferPool(t *testing.T) {
+	const (
+		chunk            = 2048
+		sourceBufferSize = 24 * 1024
+		sourceReadCap    = 31
+		runs             = 50
+	)
+
+	root, _ := keymgmt.GenerateRootKey()
+	mat, err := keymgmt.MintDEK(root, []byte("alloc-decrypt-source-buffer"))
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	payload := bytes.Repeat([]byte("c"), chunk*4)
+	ciphertext := encryptFixture(t, mat, payload, WithChunkSize(chunk))
+
+	var sourcePool sync.Pool
+	sourcePool.Put(bufio.NewReaderSize(bytes.NewReader(nil), sourceBufferSize))
+
+	allocsWithPool := testing.AllocsPerRun(runs, func() {
+		src := &cappedReader{r: bytes.NewReader(ciphertext), max: sourceReadCap}
+		r, err := NewDecryptReader(
+			src,
+			mat,
+			WithChunkSize(chunk),
+			WithSourceReadBuffer(sourceBufferSize),
+			WithSourceReadBufferPool(&sourcePool),
+		)
+		if err != nil {
+			t.Fatalf("reader: %v", err)
+		}
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			t.Fatalf("copy: %v", err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	})
+
+	allocsNoPool := testing.AllocsPerRun(runs, func() {
+		src := &cappedReader{r: bytes.NewReader(ciphertext), max: sourceReadCap}
+		r, err := NewDecryptReader(
+			src,
+			mat,
+			WithChunkSize(chunk),
+			WithSourceReadBuffer(sourceBufferSize),
+		)
+		if err != nil {
+			t.Fatalf("reader: %v", err)
+		}
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			t.Fatalf("copy: %v", err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	})
+
+	if allocsWithPool >= allocsNoPool {
+		t.Fatalf("expected source buffered pool path to allocate less; with_pool=%.1f without_pool=%.1f", allocsWithPool, allocsNoPool)
+	}
+	if allocsWithPool > 35 {
+		t.Fatalf("pooled source buffer path allocated too much: %.1f allocs/run (budget 35)", allocsWithPool)
+	}
+}
+
 // Pool entries that are undersized must be replaced rather than reused.
 func TestBufferPoolSkipsTooSmall(t *testing.T) {
 	var pool sync.Pool
@@ -284,4 +352,16 @@ func TestEncryptDecryptPoolQuick(t *testing.T) {
 	}, cfg); err != nil {
 		t.Fatalf("quick check failed: %v", err)
 	}
+}
+
+type cappedReader struct {
+	r   io.Reader
+	max int
+}
+
+func (c *cappedReader) Read(p []byte) (int, error) {
+	if len(p) > c.max {
+		p = p[:c.max]
+	}
+	return c.r.Read(p)
 }

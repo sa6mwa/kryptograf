@@ -35,7 +35,7 @@ func NewEncryptWriter(dst io.Writer, material keymgmt.Material, opts ...Option) 
 		return nil, fmt.Errorf("stream encrypt writer: cipher nonce size %d does not match descriptor size %d", crypt.NonceSize(), len(noncePrefix))
 	}
 
-	buffers, _ := borrowBuffers(cfg, int(crypt.Overhead()))
+	buffers, bufPool := borrowBuffers(cfg, int(crypt.Overhead()))
 
 	w := &writer{
 		dst:        dst,
@@ -48,7 +48,7 @@ func NewEncryptWriter(dst io.Writer, material keymgmt.Material, opts ...Option) 
 		plaintext:  buffers.plain,
 		ciphertext: buffers.cipher,
 		closer:     toCloser(dst),
-		bufPool:    cfg.bufferPool,
+		bufPool:    bufPool,
 		buffers:    buffers,
 	}
 

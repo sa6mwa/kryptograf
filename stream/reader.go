@@ -36,20 +36,22 @@ func NewDecryptReader(src io.Reader, material keymgmt.Material, opts ...Option) 
 		return nil, fmt.Errorf("stream decrypt reader: cipher nonce size %d does not match descriptor size %d", crypt.NonceSize(), len(noncePrefix))
 	}
 
-	buffers, _ := borrowBuffers(cfg, int(crypt.Overhead()))
+	buffers, bufPool := borrowBuffers(cfg, int(crypt.Overhead()))
+	sourceReader, sourceLease := wrapSourceReader(src, cfg)
 
 	r := &reader{
-		src:        src,
-		cipher:     crypt,
-		nonceBase:  slices.Clone(noncePrefix),
-		nonceBuf:   make([]byte, len(noncePrefix)),
-		headerBuf:  make([]byte, chunkio.FrameHeaderSize),
-		overhead:   crypt.Overhead(),
-		closer:     toCloser(src),
-		ciphertext: buffers.cipher,
-		plaintext:  buffers.plain,
-		bufPool:    cfg.bufferPool,
-		buffers:    buffers,
+		src:         sourceReader,
+		cipher:      crypt,
+		nonceBase:   slices.Clone(noncePrefix),
+		nonceBuf:    make([]byte, len(noncePrefix)),
+		headerBuf:   make([]byte, chunkio.FrameHeaderSize),
+		overhead:    crypt.Overhead(),
+		closer:      toCloser(src),
+		ciphertext:  buffers.cipher,
+		plaintext:   buffers.plain,
+		bufPool:     bufPool,
+		buffers:     buffers,
+		sourceLease: sourceLease,
 	}
 
 	if cfg.compressor != nil {
@@ -74,8 +76,9 @@ type reader struct {
 	closer     io.Closer
 	closed     atomic.Bool
 
-	bufPool *sync.Pool
-	buffers *bufferSet
+	bufPool     *sync.Pool
+	buffers     *bufferSet
+	sourceLease sourceReaderLease
 }
 
 func (r *reader) Read(p []byte) (int, error) {
@@ -97,7 +100,7 @@ func (r *reader) Read(p []byte) (int, error) {
 }
 
 func (r *reader) fill() error {
-	if _, err := io.ReadFull(r.src, r.headerBuf); err != nil {
+	if err := r.readSourceFull(r.headerBuf); err != nil {
 		return err
 	}
 
@@ -117,7 +120,7 @@ func (r *reader) fill() error {
 	}
 	r.ciphertext = r.ciphertext[:totalLen]
 
-	if _, err := io.ReadFull(r.src, r.ciphertext); err != nil {
+	if err := r.readSourceFull(r.ciphertext); err != nil {
 		return err
 	}
 
@@ -157,11 +160,20 @@ func (r *reader) fill() error {
 	return nil
 }
 
+func (r *reader) readSourceFull(dst []byte) error {
+	if r.sourceLease.fastReader != nil {
+		return r.sourceLease.fastReader.readFull(dst)
+	}
+	_, err := io.ReadFull(r.src, dst)
+	return err
+}
+
 func (r *reader) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 	releaseBuffers(r.bufPool, r.buffers)
+	r.sourceLease.release()
 	if r.closer != nil {
 		return r.closer.Close()
 	}

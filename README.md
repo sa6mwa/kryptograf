@@ -284,6 +284,19 @@ writer, _ := kg.EncryptWriter(dst, material, kryptograf.WithSnappy())
 reader, _ := kg.DecryptReader(src, material, kryptograf.WithSnappy())
 
 ```
+Decrypt source buffering is disabled by default. Enable it when decrypting from
+syscall-heavy sources and tune size/pooling via stream options:
+
+```go
+var sourcePool sync.Pool // stores *bufio.Reader
+reader, _ := kg.DecryptReader(
+	src,
+	material,
+	kryptograf.WithSourceReadBuffer(32*1024),
+	kryptograf.WithSourceReadBufferPool(&sourcePool),
+)
+```
+
 Built-in adapters include pooled gzip (WithGzip), Snappy, and LZ4. Custom adapters can implement
 compression.Adapter to integrate other codecs or pooling strategies.
 

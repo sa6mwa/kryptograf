@@ -9,15 +9,18 @@ import (
 )
 
 type config struct {
-	chunkSize     int
-	compressor    compression.Adapter
-	cipherFactory cipher.Factory
-	bufferPool    *sync.Pool
+	chunkSize            int
+	compressor           compression.Adapter
+	cipherFactory        cipher.Factory
+	bufferPool           *sync.Pool
+	sourceReadBufferSize int
+	sourceReadBufferPool *sync.Pool
 }
 
 const (
-	defaultChunkSize = 64 * 1024
-	minChunkSize     = 1024
+	defaultChunkSize        = 64 * 1024
+	minChunkSize            = 1024
+	minSourceReadBufferSize = 1024
 )
 
 // Option configures the behaviour of encrypting/decrypting streams.
@@ -53,6 +56,33 @@ func WithChunkSize(n int) Option {
 func WithBufferPool(pool *sync.Pool) Option {
 	return func(cfg *config) {
 		cfg.bufferPool = pool
+	}
+}
+
+// WithSourceReadBuffer controls decrypt source read buffering in bytes.
+// Source buffering is disabled by default. Set n > 0 to enable source
+// buffering; set n to 0 to disable it explicitly. Values from 1 to 1023 panic.
+func WithSourceReadBuffer(n int) Option {
+	return func(cfg *config) {
+		if n < 0 {
+			panic("kryptograf/stream: source read buffer size must be >= 0")
+		}
+		if n > 0 && n < minSourceReadBufferSize {
+			panic(fmt.Sprintf("kryptograf/stream: source read buffer size must be >= %d or 0 to disable", minSourceReadBufferSize))
+		}
+		cfg.sourceReadBufferSize = n
+	}
+}
+
+// WithSourceReadBufferPool lets decrypt readers reuse buffered source reader
+// instances and avoid per-reader buffer churn. The pool should store
+// *bufio.Reader values sized for the chosen source buffer size. Readers are
+// reset before being put back and are owned by decrypt reader instances while
+// in use. Passing nil leaves custom pooling disabled; built-in pools are used
+// for common sizes (8/16/32/64 KiB).
+func WithSourceReadBufferPool(pool *sync.Pool) Option {
+	return func(cfg *config) {
+		cfg.sourceReadBufferPool = pool
 	}
 }
 

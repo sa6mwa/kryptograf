@@ -43,6 +43,14 @@ func WithCompression(adapter compression.Adapter) StreamOption {
 // WithBufferPool forwards to stream.WithBufferPool.
 func WithBufferPool(pool *sync.Pool) StreamOption { return stream.WithBufferPool(pool) }
 
+// WithSourceReadBuffer forwards to stream.WithSourceReadBuffer.
+func WithSourceReadBuffer(size int) StreamOption { return stream.WithSourceReadBuffer(size) }
+
+// WithSourceReadBufferPool forwards to stream.WithSourceReadBufferPool.
+func WithSourceReadBufferPool(pool *sync.Pool) StreamOption {
+	return stream.WithSourceReadBufferPool(pool)
+}
+
 // WithCipher forwards to stream.WithCipher.
 func WithCipher(factory cipher.Factory) StreamOption { return stream.WithCipher(factory) }
 
@@ -63,6 +71,10 @@ type Kryptograf interface {
 	WithLZ4() Kryptograf
 	// WithCompression returns a Kryptograf that applies the supplied compression adapter when streaming.
 	WithCompression(adapter compression.Adapter) Kryptograf
+	// WithSourceReadBuffer sets decrypt source read buffering in bytes.
+	WithSourceReadBuffer(size int) Kryptograf
+	// WithSourceReadBufferPool sets a shared pool used for decrypt source buffered readers.
+	WithSourceReadBufferPool(pool *sync.Pool) Kryptograf
 	// WithCipher returns a Kryptograf that encrypts using the supplied cipher factory.
 	WithCipher(factory cipher.Factory) Kryptograf
 	// RootKey reveals the underlying root key used to mint derived keys.
@@ -125,6 +137,16 @@ func (s *service) WithLZ4() Kryptograf {
 // WithCompression selects the compression adapter for the instance.
 func (s *service) WithCompression(adapter compression.Adapter) Kryptograf {
 	return s.WithOptions(WithCompression(adapter))
+}
+
+// WithSourceReadBuffer configures decrypt source read buffering for the instance.
+func (s *service) WithSourceReadBuffer(size int) Kryptograf {
+	return s.WithOptions(WithSourceReadBuffer(size))
+}
+
+// WithSourceReadBufferPool configures decrypt source buffer pooling for the instance.
+func (s *service) WithSourceReadBufferPool(pool *sync.Pool) Kryptograf {
+	return s.WithOptions(WithSourceReadBufferPool(pool))
 }
 
 // WithCipher selects the cipher implementation for the instance.

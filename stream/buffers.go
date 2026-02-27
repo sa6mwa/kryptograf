@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 )
 
+var builtInChunkBufferPoolDefault sync.Pool
+
 // bufferSet groups plaintext and ciphertext scratch space used by stream
 // readers/writers so they can be pooled together.
 type bufferSet struct {
@@ -20,22 +22,37 @@ func newBufferSet(chunkSize, overhead int) *bufferSet {
 	}
 }
 
-func borrowBuffers(cfg config, overhead int) (*bufferSet, bool) {
-	if cfg.bufferPool == nil {
-		return newBufferSet(cfg.chunkSize, overhead), false
+func borrowBuffers(cfg config, overhead int) (*bufferSet, *sync.Pool) {
+	pool := cfg.bufferPool
+	if pool == nil {
+		pool = builtInChunkBufferPool(cfg.chunkSize, overhead)
 	}
-	if v := cfg.bufferPool.Get(); v != nil {
+	if pool == nil {
+		return newBufferSet(cfg.chunkSize, overhead), nil
+	}
+	if v := pool.Get(); v != nil {
 		if bs, ok := v.(*bufferSet); ok && cap(bs.plain) >= cfg.chunkSize && cap(bs.cipher) >= cfg.chunkSize+overhead {
 			bs.plain = bs.plain[:0]
 			bs.cipher = bs.cipher[:0]
-			// mark in-use for debug
 			atomic.StoreUint32(&bs.inUse, 1)
-			return bs, true
+			return bs, pool
 		}
 	}
 	bs := newBufferSet(cfg.chunkSize, overhead)
 	atomic.StoreUint32(&bs.inUse, 1)
-	return bs, true
+	return bs, pool
+}
+
+func builtInChunkBufferPool(chunkSize, overhead int) *sync.Pool {
+	// Keep internal pooling bounded to the default chunk profile. Callers that
+	// tune chunk size can opt into explicit pooling with WithBufferPool.
+	if chunkSize != defaultChunkSize {
+		return nil
+	}
+	if overhead < 0 || overhead > 128 {
+		return nil
+	}
+	return &builtInChunkBufferPoolDefault
 }
 
 func releaseBuffers(pool *sync.Pool, bs *bufferSet) {
